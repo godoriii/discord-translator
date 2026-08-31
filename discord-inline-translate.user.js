@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Inline Translator (KO)
 // @namespace    https://github.com/godoriii/discord-translator
-// @version      0.1.1
+// @version      0.1.2
 // @description  디스코드 웹 채팅을 사용자 용어집 기반으로 한국어 인라인 번역
 // @match        https://discord.com/*
 // @match        https://ptb.discord.com/*
@@ -25,7 +25,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '0.1.0';
+  var SCRIPT_VERSION = '0.1.2';
 
   // ===== 1. CONSTANTS =====
   var C = {
@@ -160,7 +160,12 @@
       pausedUntil: 0,
       pauseReason: '',
       consecutiveRateLimits: 0,
-      seq: 0
+      seq: 0,
+      // Pending _scheduleRetry timer ids. Tracked so _stopAll (and the test
+      // harness's resetState) can cancel them — an orphaned retry timer
+      // fires later and silently re-queues a batch into state that has
+      // since been cleared.
+      retryTimers: new Set()
     },
     recentByChannel: new Map(),
     previousSeen: new Set(),
@@ -1267,7 +1272,14 @@
     },
     request: function (body) {
       return new Promise(function (resolve) {
-        if (cfg.mockApi && cfg.mockApi !== 'off') { resolve(MockApi.handle(body)); return; }
+        if (cfg.mockApi && cfg.mockApi !== 'off') {
+          // Must resolve on a macrotask, never synchronously: a retrying
+          // request cycle (requeue/bisect) otherwise runs as one unyielding
+          // microtask chain that starves timers and rendering — the real
+          // network path always yields, and the mock has to match that.
+          setTimeout(function () { resolve(MockApi.handle(body)); }, 0);
+          return;
+        }
         if (!GM.xhr) { resolve({ status: 0, error: 'no-gm-xhr' }); return; }
         var headers = {
           'content-type': 'application/json',
@@ -1585,15 +1597,37 @@
       batch.forEach(function (it) { it.attempts = (it.attempts || 0) + 1; it.enqueuedAt = Util.now(); it.seq = State.queue.seq++; State.queue.queued.push(it); });
     },
     _scheduleRetry: function (batch, delay) {
-      setTimeout(function () { Queue._requeueSameBatch(batch); Queue.tick(); }, delay);
+      var tid = setTimeout(function () {
+        State.queue.retryTimers.delete(tid);
+        Queue._requeueSameBatch(batch);
+        Queue.tick();
+      }, delay);
+      State.queue.retryTimers.add(tid);
     },
     _bisect: function (batch) {
+      // The halves must NOT go back through the queue: tick()'s packer
+      // would immediately re-merge them into the very batch that just
+      // failed, and the old attempts reset kept that requeue↔bisect cycle
+      // from ever reaching an exit condition (an unbounded retry loop).
+      // Direct sends keep the halves separate, so every bisection level
+      // strictly shrinks the batch and the cycle terminates at singles.
+      // attempts is carried as-is — never reset — so the single-item
+      // failure paths in onResponse still fire.
       var mid = Math.ceil(batch.length / 2);
-      var a = batch.slice(0, mid), b = batch.slice(mid);
-      [a, b].forEach(function (part) {
-        part.forEach(function (it) { it.attempts = 0; it.enqueuedAt = Util.now(); it.seq = State.queue.seq++; State.queue.queued.push(it); });
-      });
-      Queue.tick();
+      var parts = [batch.slice(0, mid), batch.slice(mid)].filter(function (p) { return p.length; });
+      var sendParts = function () {
+        // Direct sends skip the queue, so honor the two queue-level gates
+        // ourselves: a disabled client must not fire requests (same silent
+        // drop as _stopAll), and a backoff pause must delay the halves.
+        if (!cfg.enabled) return;
+        var wait = (State.queue.pausedUntil || 0) - Util.now();
+        if (wait > 0) { setTimeout(sendParts, wait + 20); return; }
+        parts.forEach(function (part) {
+          part.forEach(function (it) { it.enqueuedAt = Util.now(); });
+          Queue._send(part);
+        });
+      };
+      sendParts();
     },
     _requeueSingle: function (item) {
       if ((item._partialRetries || 0) >= 1) { Queue._markFailed(item, 'partial'); return; }
@@ -1612,6 +1646,11 @@
     },
     _stopAll: function () {
       State.queue.queued = [];
+      // Cancel pending retries too — otherwise a backoff timer armed before
+      // the stop fires afterwards and re-queues a batch into a client that
+      // was just disabled (e.g. after an auth failure).
+      State.queue.retryTimers.forEach(function (t) { clearTimeout(t); });
+      State.queue.retryTimers.clear();
     },
     retry: function (msgId) {
       var f = State.queue.failed.get(msgId);
@@ -1975,6 +2014,25 @@
   };
 
   // ===== 14. Reconcile core loop =====
+  // Glossary-rev conditional re-translation (§3.1): when the glossary rev
+  // moved, re-translate ONLY if this message's matched-term SET changed;
+  // otherwise just stamp the cache entry with the new rev. Called both for
+  // cache-hit rehydration and for messages whose block is already rendered
+  // — the latter is the common case, and checking it only on the cache-hit
+  // path left rev changes invisible for mounted, already-done messages.
+  function glossaryRecheck(item, ch, key, hit) {
+    if (hit.gv === Glossary.rev()) return;
+    var newMatches = Glossary.match(item.text).map(function (m) { return m.en; }).sort();
+    var oldMatches = (hit.mt || []).slice().sort();
+    if (JSON.stringify(newMatches) !== JSON.stringify(oldMatches)) {
+      item.channelId = ch;
+      Queue.enqueue(item, 2);
+    } else {
+      hit.gv = Glossary.rev();
+      TCache.set(key, hit);
+    }
+  }
+
   function decidePriority(item, isNewlyMounted, ch) {
     if (cfg.perChannelOff.indexOf(ch) !== -1) return null;
     if (!cfg.autoTranslate) return null;
@@ -1994,7 +2052,13 @@
         seen.add(item.msgId);
         var anchorEl = item.anchorEl || accNode;
         var existing = Render.blockFor(item.msgId);
-        if (existing && existing.dataset.dcxltHash === item.hash && existing.dataset.state !== 'error') return;
+        if (existing && existing.dataset.dcxltHash === item.hash) {
+          // Same guard as the message path below: a FAILED embed keeps its
+          // error block for the manual retry button — auto-requeueing it
+          // here would clear the failed entry and retry forever.
+          if (existing.dataset.state !== 'error') return;
+          if (State.queue.failed.has(item.msgId)) return;
+        }
         var sk = Extract.shouldSkip(item);
         if (sk.skip) { Render.remove(item.msgId); return; }
         var key = TCache.key(item.msgId, item.hash);
@@ -2030,7 +2094,25 @@
       var existing = node.nextElementSibling;
       if (!existing || !existing.classList || !existing.classList.contains('dcxlt')) existing = Render.blockFor(msgId);
 
-      if (existing && existing.dataset.dcxltHash === item.hash && existing.dataset.state !== 'error') return;
+      if (existing && existing.dataset.dcxltHash === item.hash) {
+        if (existing.dataset.state === 'error') {
+          // A failed message keeps its error block until the user clicks
+          // retry (§9-17). Auto-requeueing here would erase the FAILED
+          // state milliseconds after _markFailed set it and retry the same
+          // content forever. Only an error block WITHOUT a failed entry
+          // (stale render, e.g. after a cache wipe) falls through to the
+          // normal path below and recovers on its own.
+          if (State.queue.failed.has(msgId)) return;
+        } else {
+          // Same content already rendered — but a glossary rev change must
+          // still be honored here: this is the only moment a mounted,
+          // already-done message can schedule its conditional re-translation.
+          var doneKey = TCache.key(msgId, item.hash);
+          var doneHit = TCache.get(doneKey);
+          if (doneHit) glossaryRecheck(item, ch, doneKey, doneHit);
+          return;
+        }
+      }
 
       var sk = Extract.shouldSkip(item);
       if (sk.skip) {
@@ -2044,18 +2126,7 @@
       var hit = TCache.get(key);
       if (hit) {
         Render.upsert(node, msgId, 'done', Object.assign({}, hit, { hash: item.hash }));
-        if (hit.gv !== Glossary.rev()) {
-          var newMatches = Glossary.match(item.text).map(function (m) { return m.en; }).sort();
-          var oldMatches = (hit.mt || []).slice().sort();
-          var changed = JSON.stringify(newMatches) !== JSON.stringify(oldMatches);
-          if (changed) {
-            item.channelId = ch;
-            Queue.enqueue(item, 2);
-          } else {
-            hit.gv = Glossary.rev();
-            TCache.set(key, hit);
-          }
-        }
+        glossaryRecheck(item, ch, key, hit);
         return;
       }
 

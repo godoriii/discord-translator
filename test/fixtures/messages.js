@@ -25,9 +25,18 @@
   }
 
   function scrollerWrap(inner) {
-    var scroller = el('div', { class: 'scroller_x1 scrollerBase_x1', style: 'overflow-y:auto;height:400px' }, [inner]);
-    var content = el('div', { class: 'scrollerContent_x1' }, [scroller]);
-    var wrapper = el('div', { class: 'messagesWrapper_x1' }, [content]);
+    // Nesting must match the REAL observed chain (docs/discord-dom-facts.md):
+    // main.chatContent > div.messagesWrapper > div.scroller (the overflow
+    // container) > div.scrollerContent > ol.scrollerInner. With the old,
+    // inverted order (scrollerContent OUTSIDE scroller) the userscript's
+    // scroller selector `div[class*="messagesWrapper"] div[class*="scroller"]`
+    // matched scrollerContent first in document order — an element whose
+    // scrollHeight always equals its clientHeight — so nearBottom was
+    // permanently true and every scroll-position-gated scenario (23, 28)
+    // failed against behavior that is correct on real discord.com.
+    var content = el('div', { class: 'scrollerContent_x1' }, [inner]);
+    var scroller = el('div', { class: 'scroller_x1 scrollerBase_x1', style: 'overflow-y:auto;height:400px' }, [content]);
+    var wrapper = el('div', { class: 'messagesWrapper_x1' }, [scroller]);
     var main = el('main', { class: 'chatContent_x1' }, [wrapper]);
     return main;
   }

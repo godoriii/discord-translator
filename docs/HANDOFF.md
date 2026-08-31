@@ -1,6 +1,6 @@
 # HANDOFF — 다른 기기에서 이어서 작업하기
 
-> 최종 갱신: 2026-08-31 23:25 (회사 Mac 세션에서 인계). 집 컴퓨터에서 이어받기.
+> 최종 갱신: 2026-09-01 (집 컴퓨터 세션). 하네스 34/34 클린 통과 달성, v0.1.2.
 
 ## 이 프로젝트가 무엇인가
 Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 메시지를 Claude API로 한국어 인라인 번역하고, 사용자 용어집(`glossary.json`, WoW 공식 한국어 명칭)을 강제 적용한다. Windows/Mac 동일 스크립트 한 벌, GitHub raw URL로 자동 업데이트.
@@ -13,47 +13,48 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
 
 ## 현재 상태
 - [x] 설계 확정, DOM 실측, 용어집 45항목
-- [x] 구현 (`discord-inline-translate.user.js` 2,193줄, v0.1.1)
-- [x] 실제 디스코드 탭 mock 주입 스모크 테스트 — 전 항목 PASS (탐지 13/13, 렌더 위치, 플레이스홀더, edited 제외, 네트워크 0)
-- [ ] 하네스 34 시나리오 헤드리스 최종 검증 (백그라운드 탭에선 스로틀링으로 28/34; headless CDP 재실행 중)
-- [ ] API 키 넣고 실제 번역 확인 (키는 Tampermonkey 설정 패널에 사용자가 직접 입력)
+- [x] 구현 (`discord-inline-translate.user.js`, v0.1.2)
+- [x] 실제 디스코드 탭 mock 주입 스모크 테스트 — 전 항목 PASS (v0.1.1 기준; v0.1.2 변경은 큐 실패경로/mock 한정이라 영향 없음, 그래도 설치 후 1회 재확인 권장)
+- [x] **하네스 34 시나리오 헤드리스 최종 검증 — 34/34 PASS, 네트워크 0건** (2026-09-01, 아래 "검증 방법" 참조)
 - [x] README(한국어) 완성, GitHub 푸시
+- [ ] API 키 넣고 실제 번역 확인 (키는 Tampermonkey 설정 패널에 사용자가 직접 입력)
 - [ ] 양쪽 PC 설치 + API 키 입력 + 실제 번역 1회 확인
 
-## 집에서 시작하는 법
-1. Chrome에 Tampermonkey 설치 → 리포의 raw URL(`https://raw.githubusercontent.com/godoriii/discord-translator/main/discord-inline-translate.user.js`)을 주소창에 열면 설치 창이 뜸.
-2. Tampermonkey 메뉴 → "설정" → Anthropic API 키 입력, 모델 선택(기본 claude-opus-5).
-3. discord.com 채널에 들어가면 영어 메시지 아래 번역이 붙음. Alt+T로 전체 토글.
-4. 개발을 이어가려면 `git clone`, Claude Code 실행 후 "docs/HANDOFF.md 부터 읽고 남은 체크리스트 진행" 지시.
+## 2026-09-01 세션에서 찾아 고친 것 (v0.1.2)
+
+이전 세션의 "headless CPU 100% / 백그라운드 28/34" 미스터리는 전부 규명됐다.
+
+1. **Queue 무한 재큐 루프 (렌더러 프리즈의 진범)** — 파싱 실패/max_tokens/fatal 응답에서 `_bisect`가 조각을 큐에 되넣으면 `tick`의 배치 패커가 즉시 같은 배치로 재병합했고, attempts까지 0으로 리셋해 탈출 조건에 영원히 못 닿았다 (브라우저 워치독 실측: `_requeueSameBatch` 7,146회 ↔ `_bisect` 7,142회 교대; Codex/Opus 교차 검증 일치). **수정**: `_bisect`가 조각을 `Queue._send`로 직접 전송(재병합 원천 차단, 이분할마다 크기 절반 → 종료 보장), attempts 리셋 제거, pausedUntil/enabled 게이트 준수.
+2. **mock 동기 resolve** — 재시도 사이클이 양보 없는 microtask 체인이 되어 탭을 프리즈시켰다. **수정**: mock 응답 `setTimeout(0)` macrotask화 (실 API 경로 무변경).
+3. **실패 후 자동 재큐 루프 (실서비스 과금 버그)** — `_markFailed` 1ms 뒤 reconcile이 error 블록 메시지를 도로 enqueue(→`failed` 삭제) → 지속 서버 오류 시 무한 API 재시도. **수정**: reconcile/reconcileEmbeds에 `failed` 가드 (수동 재시도 버튼 설계 의도대로).
+4. **용어집 rev 재번역 로직이 죽은 코드였음** — done 블록이 마운트된 상태(일반 케이스)에서는 rev 비교 지점에 도달하기 전에 return. **수정**: `glossaryRecheck` 헬퍼로 추출해 done-블록 경로에서도 호출.
+5. **좀비 backoff 타이머** — `_scheduleRetry` 타이머가 정지/리셋 후에도 발화해 stale 배치를 주입. **수정**: `State.queue.retryTimers`로 추적, `_stopAll`과 하네스 `resetState`에서 취소.
+6. **하네스 픽스처 DOM 중첩이 실제와 반대** — 픽스처가 `scrollerContent > scroller` 순서로 만들어 셀렉터가 스크롤 불가능한 요소를 잡았고, `nearBottom`이 항상 true였다 (시나리오 23·28이 실디스코드에선 올바른 동작에 대해 실패). **수정**: 실측 체인(`messagesWrapper > scroller > scrollerContent > ol`)대로 재정렬 + `addMessage`에 디스코드식 하단 고정(auto-pin) 에뮬레이션.
 
 ## 검증 방법
 - `node --check discord-inline-translate.user.js`
-- `test/harness.html` 을 Chrome에서 `file://` 로 열고 콘솔에서 `await __DCXLT_TEST__.runAll()` → 33개 PASS 확인 (mock API, 네트워크 0건)
+- **헤드리스 전체 검증(권장, 사람 개입 불필요)**: 리포 루트에서
+  ```
+  python3 -m http.server 8899 --bind 127.0.0.1 &
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new \
+    --no-first-run --mute-audio --disable-background-timer-throttling \
+    --disable-renderer-backgrounding --user-data-dir=/tmp/dcxlt-ci \
+    --enable-logging=stderr --v=0 \
+    "http://127.0.0.1:8899/test/harness.html?autorun=1" 2>&1 | grep DCXLT_SUMMARY
+  ```
+  `DCXLT_SUMMARY pass=34 fail=0 skipped=0 xhr=0` 이 나와야 한다. (완주 후 크롬은 직접 kill)
+  - 참고: `--virtual-time-budget`은 영구 setInterval과 상극이라 여전히 금지. 위처럼 실시간 타이머 + 스로틀링 비활성 플래그로 돌린다.
+  - 하네스 디버그 파라미터: `&only=3,17,28`(부분 실행), `&spy=1`(큐 이벤트 `DCXLT_TRACE` 콘솔 트레이스), 완주 시 `DCXLT_RESULTS <json>` 콘솔 라인으로 시나리오별 결과 수집 가능.
+- 포그라운드 브라우저에서 보고 싶으면: `http://127.0.0.1:8899/test/harness.html` 을 **화면에 보이는 탭**으로 열고 `await __DCXLT_TEST__.runAll()`. (hidden 탭은 타이머 스로틀링 때문에 타이밍 시나리오가 가짜로 실패한다 — 이전 세션의 "백그라운드 28/34"가 그것)
 - 실제 페이지 스모크: DevTools 콘솔에서 `test/inject-shim.js` 내용 실행 → 이어서 유저스크립트 본문 실행 → `window.__DCXLT__` 로 탐지 수 확인
 
-
-## ⚠️ 집에서 가장 먼저 할 일 — 하네스 전체 실행 검증 (미완)
-현재 **유저스크립트 자체는 실제 discord.com에서 스모크 테스트 전 항목 PASS**라 실사용은 문제없다.
-막힌 것은 **자동 테스트 하네스(test/harness.html)의 34개 시나리오 클린 1회 통과**뿐이다.
-
-관측된 증상:
-- 백그라운드(hidden) 탭에서 돌리면 브라우저 타이머 스로틀링으로 28/34까지만(타이밍 의존 6개가 흔들림).
-- headless Chrome `--virtual-time-budget` 로 돌리면 **끝나지 않고 렌더러 CPU 100% 고정**.
-  - 원인 절반 확인: 유저스크립트가 영구 `setInterval` 2개를 건다 — `discord-inline-translate.user.js:2127`(reconcile), `:2129`(Queue.tick,100). 대기 타이머가 항상 있어 virtual time이 예산에 못 도달 → 무한 fast-forward.
-- headless(가상시간 아님, 실시간 타이머)로 CDP 구동해도 렌더러 CPU 100% 고정이 재현됨 → **동기 무한 루프가 따로 있을 가능성**. 아직 위치 못 찾음. 확인해서 정상으로 보인 곳: `Glossary.match`(i 항상 전진), `rehydrate`(전역 regex lastIndex 전진), `_authorFor`(hops<15 bounded). 남은 의심: 시나리오 2("200ms 간격 5개 유입/디바운스 병합") 진입 후 멈춘 정황.
-
-권장 진행 순서(집에서):
-1. **포그라운드 보이는 일반 Chrome 탭**에서 검증하는 게 정석 — 하네스는 그 환경 기준으로 만들어짐. 로컬 서버 띄우고(`cd ~/discord-translator && python3 -m http.server 8765`) `http://127.0.0.1:8765/test/harness.html` 를 **활성 탭**으로 연 뒤 콘솔에서 `await __DCXLT_TEST__.runAll()`. (autorun은 `...?autorun=1`)
-2. 그래도 특정 시나리오에서 CPU가 물리면, 시나리오별 워치독을 넣어 **어느 시나리오가 스핀하는지 이분 탐색**으로 특정 → 해당 코드 경로의 동기 루프 수정.
-3. headless/CI로도 돌리고 싶으면: 하네스에 **가짜 타이머(setTimeout/setInterval 오버라이드 + 수동 시간 전진)** 를 넣거나, 유저스크립트 부트가 테스트 모드일 때 영구 setInterval을 걸지 않도록 훅 추가. (`--virtual-time-budget` 는 영구 setInterval과 상극이므로 지양)
-4. 34개 전부 PASS 되면 `@version` 을 0.1.2로 올리고 커밋·푸시.
-
-진단에 쓴 도구는 회사 머신 임시폴더에 있었고 리포에는 없음. 필요하면 새로 만들면 된다(CDP 러너 등).
+## 남은 개선 아이디어 (선택)
+- max_tokens 다항목 배치를 태우는 mock 모드 + 시나리오 추가 (현재 스위트는 이 경로를 다항목으로 커버하지 않음 — Opus 분석 지적)
+- `_bisect` 직접 전송은 이분할 순간에 동시성 한도를 일시 초과할 수 있음(최대 BATCH_MAX_ITEMS=8, 유계). 문제되면 큐 기반 + 재병합 차단(maxBatch 태그) 방식으로 교체 검토.
 
 ## 진행 로그
-- 18:40 GitHub 공개 리포 생성·초기 스냅샷 푸시 (사용자 승인)
-- 19:10 구현 워커 1차 완료: 유저스크립트 2,135줄, 하네스 34 시나리오 중 28 PASS(나머지는 백그라운드 탭 타이머 스로틀링 영향으로 판단) → 헤드리스 가상시간 재검증 지시
-- 19:20 README 한국어 재작성 완료
-- 19:00~19:55 사이 Mac이 절전에 들어가 스모크 테스트 에이전트 중단 → caffeinate 재가동 후 재시도 중
-- 23:15 v0.1.1 푸시(실디스코드 스모크 PASS 버전). 하네스 헤드리스 검증은 진행 중 — 결과 나오면 이 파일 갱신
-- 23:25 회사 머신에서 인계. 하네스 전체통과 미완(위 ⚠️ 절 참조). 유저스크립트 실디스코드 스모크는 PASS. 폭주하던 headless/탭 렌더러는 전부 종료해 CPU 정리 완료.
+- 08-31 18:40 GitHub 공개 리포 생성·초기 스냅샷 푸시 (사용자 승인)
+- 08-31 19:10 구현 워커 1차 완료: 하네스 34 중 28 PASS → 헤드리스 재검증 지시
+- 08-31 23:15 v0.1.1 푸시(실디스코드 스모크 PASS 버전)
+- 08-31 23:25 회사 머신에서 인계
+- 09-01 00:00~01:30 집 세션: 프리즈 재현 → 워치독으로 무한 루프 실측 특정(시나리오 18 방아쇠) → Codex/Opus 교차 검증 → 위 6건 수정 → **헤드리스 34/34 PASS 2회 연속** → v0.1.2
