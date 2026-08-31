@@ -28,3 +28,9 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
 - `node --check discord-inline-translate.user.js`
 - `test/harness.html` 을 Chrome에서 `file://` 로 열고 콘솔에서 `await __DCXLT_TEST__.runAll()` → 33개 PASS 확인 (mock API, 네트워크 0건)
 - 실제 페이지 스모크: DevTools 콘솔에서 `test/inject-shim.js` 내용 실행 → 이어서 유저스크립트 본문 실행 → `window.__DCXLT__` 로 탐지 수 확인
+
+## 진행 로그
+- 18:40 GitHub 공개 리포 생성·초기 스냅샷 푸시 (사용자 승인)
+- 19:10 구현 워커 1차 완료: 유저스크립트 2,135줄, 하네스 34 시나리오 중 28 PASS(나머지는 백그라운드 탭 타이머 스로틀링 영향으로 판단) → 헤드리스 가상시간 재검증 지시
+- 19:20 README 한국어 재작성 완료
+- 19:00~19:55 사이 Mac이 절전에 들어가 스모크 테스트 에이전트 중단 → caffeinate 재가동 후 재시도 중
