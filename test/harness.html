@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>discord-inline-translate.user.js — test harness</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #313338; color: #dbdee1; margin: 0; padding: 16px; }
+  h1 { font-size: 16px; }
+  #layout { display: flex; gap: 16px; align-items: flex-start; }
+  #panel { flex: 0 0 260px; }
+  #stage { flex: 0 0 420px; }
+  #report-wrap { flex: 1; min-width: 320px; }
+  button { cursor: pointer; padding: 8px 12px; margin: 4px 0; width: 100%; background: #5865f2; color: #fff; border: none; border-radius: 4px; }
+  #dcxlt-test-report table { background: #1e1f22; color: #dbdee1; width: 100%; }
+  #dcxlt-test-report th { background: #2b2d31; }
+  #stage-outer { border: 1px solid #444; }
+  pre#log { background: #111214; color: #ddd; padding: 8px; font-size: 11px; max-height: 200px; overflow: auto; }
+</style>
+</head>
+<body>
+<h1>Discord Inline Translator — Test Harness</h1>
+<div id="layout">
+  <div id="panel">
+    <button id="run-all-btn">전체 시나리오 실행 (runAll)</button>
+    <p style="font-size:12px">콘솔 또는 <code>await window.__DCXLT_TEST__.runAll()</code> 로도 실행 가능합니다.</p>
+    <pre id="log"></pre>
+  </div>
+  <div id="stage">
+    <div id="stage-outer"></div>
+  </div>
+  <div id="report-wrap">
+    <div id="dcxlt-test-report">아직 실행되지 않음.</div>
+  </div>
+</div>
+
+<!-- 1) GM_* shim + scenario driver (must load before the userscript) -->
+<!-- Absolute paths (leading /) throughout: the setup script below calls
+     history.replaceState to give the page a Discord-shaped /channels/../..
+     URL before the userscript boots, which changes the effective base URL
+     for any RELATIVE src on script tags that come after it — so every
+     script tag here uses an absolute, base-URL-independent path. -->
+<script src="/test/harness.js"></script>
+<!-- 2) DOM fixture builders -->
+<script src="/test/fixtures/messages.js"></script>
+<script src="/test/fixtures/responses.js"></script>
+<!-- 3) build the initial fake-Discord DOM skeleton the userscript will probe on boot -->
+<script>
+  (function () {
+    // Give the harness page a real Discord-shaped URL (/channels/<guild>/<channel>)
+    // from the start, via replaceState (no navigation/reload). Real Discord's
+    // location.pathname always has this shape, so Router.currentChannel() at
+    // userscript boot time should resolve the channel from the URL just like
+    // it would in production, keeping Router._lastChannel correctly seeded —
+    // rather than drifting from the id-fallback path the Router only uses
+    // when the URL genuinely doesn't match (which never happens on real
+    // discord.com/channels/... pages).
+    history.replaceState({}, '', '/channels/999999999999999999/111111111111111111');
+
+    var root = Fixtures.chatRoot();
+    root.id = 'dcxlt-test-chatroot';
+    var wrapped = Fixtures.scrollerWrap(root);
+    document.getElementById('stage-outer').appendChild(wrapped);
+
+    var origLog = console.log, origWarn = console.warn, origError = console.error;
+    var logEl = document.getElementById('log');
+    function append(prefix, args) {
+      var line = prefix + ' ' + Array.prototype.slice.call(args).map(function (a) {
+        try { return typeof a === 'string' ? a : JSON.stringify(a); } catch (e) { return String(a); }
+      }).join(' ');
+      logEl.textContent += line + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    console.log = function () { append('[log]', arguments); origLog.apply(console, arguments); };
+    console.warn = function () { append('[warn]', arguments); origWarn.apply(console, arguments); };
+    console.error = function () { append('[error]', arguments); origError.apply(console, arguments); };
+  })();
+</script>
+<!-- 4) the userscript itself -->
+<script src="/discord-inline-translate.user.js"></script>
+<!-- 5) wire the run button -->
+<script>
+  document.getElementById('run-all-btn').addEventListener('click', function () {
+    window.__DCXLT_TEST__.runAll();
+  });
+</script>
+</body>
+</html>

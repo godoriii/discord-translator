@@ -1,0 +1,30 @@
+# HANDOFF — 다른 기기에서 이어서 작업하기
+
+> 최종 갱신: 2026-08-31 18:40 (회사 Mac 세션). 이 파일은 세션 종료 시 다시 갱신됨.
+
+## 이 프로젝트가 무엇인가
+Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 메시지를 Claude API로 한국어 인라인 번역하고, 사용자 용어집(`glossary.json`, WoW 공식 한국어 명칭)을 강제 적용한다. Windows/Mac 동일 스크립트 한 벌, GitHub raw URL로 자동 업데이트.
+
+## 문서 읽는 순서 (새 Claude Code 세션에 "docs/ 를 읽고 이어서 해줘" 라고 하면 됨)
+1. `docs/decisions.md` — 오케스트레이터 최종 결정(무엇을 왜 택했는지)
+2. `docs/design-spec.md` — 1차 구현 지시서(deep-reasoner). 모듈/알고리즘/프롬프트/시나리오 33개
+3. `docs/discord-dom-facts.md` — 실제 디스코드 DOM 관측치(셀렉터 근거)
+4. `docs/design-alt-codex.md`, `docs/design-brief.md` — 참고
+
+## 현재 상태
+- [x] 설계 확정, DOM 실측, 용어집 45항목
+- [ ] 구현 (`discord-inline-translate.user.js` ~2,100줄 작성됨, 하네스 33 시나리오 검증 진행 중)
+- [ ] 실제 디스코드 탭 mock 주입 스모크 테스트
+- [ ] API 키 넣고 실제 번역 확인 (키는 Tampermonkey 설정 패널에 사용자가 직접 입력)
+- [ ] README 완성, GitHub 푸시, 양쪽 PC 설치
+
+## 집에서 시작하는 법
+1. Chrome에 Tampermonkey 설치 → 리포의 raw URL(`https://raw.githubusercontent.com/godoriii/discord-translator/main/discord-inline-translate.user.js`)을 주소창에 열면 설치 창이 뜸.
+2. Tampermonkey 메뉴 → "설정" → Anthropic API 키 입력, 모델 선택(기본 claude-opus-5).
+3. discord.com 채널에 들어가면 영어 메시지 아래 번역이 붙음. Alt+T로 전체 토글.
+4. 개발을 이어가려면 `git clone`, Claude Code 실행 후 "docs/HANDOFF.md 부터 읽고 남은 체크리스트 진행" 지시.
+
+## 검증 방법
+- `node --check discord-inline-translate.user.js`
+- `test/harness.html` 을 Chrome에서 `file://` 로 열고 콘솔에서 `await __DCXLT_TEST__.runAll()` → 33개 PASS 확인 (mock API, 네트워크 0건)
+- 실제 페이지 스모크: DevTools 콘솔에서 `test/inject-shim.js` 내용 실행 → 이어서 유저스크립트 본문 실행 → `window.__DCXLT__` 로 탐지 수 확인

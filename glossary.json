@@ -1,0 +1,302 @@
+{
+  "version": 1,
+  "updatedAt": "2026-08-31",
+  "entries": [
+    {
+      "en": "Abyssal Rain",
+      "ko": "심연의 비",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Alluring Bubble",
+      "ko": "매혹하는 거품",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Aspect of the Cheetah",
+      "ko": "치타의 상",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Aspect of the Eagle",
+      "ko": "독수리의 상",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Aspect of the Turtle",
+      "ko": "거북상",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Boomstick",
+      "ko": "붐스틱",
+      "cat": "item",
+      "domain": "wow"
+    },
+    {
+      "en": "cantrip",
+      "ko": "착효",
+      "cat": "term",
+      "note": "착용 발동 효과. '캔트립' 금지",
+      "domain": "wow"
+    },
+    {
+      "en": "Chilling Frost",
+      "ko": "오싹한 서리",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Devourer",
+      "ko": "포식자",
+      "tentative": true,
+      "cat": "skill",
+      "note": "악사 신규 특성",
+      "domain": "wow"
+    },
+    {
+      "en": "DPS Rotation",
+      "ko": "딜 사이클",
+      "cat": "term",
+      "domain": "wow"
+    },
+    {
+      "en": "Exhilaration",
+      "ko": "활기",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Gaze of the Coiled Watcher",
+      "ko": "똬리 감시자의 응시",
+      "tentative": true,
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Gebbo's Bottomless Bag",
+      "ko": "게보의 바닥없는 가방",
+      "tentative": true,
+      "cat": "item",
+      "note": "Gabbo 아님",
+      "domain": "wow"
+    },
+    {
+      "en": "Grand Magister Rommath",
+      "ko": "대마법학자 롬마스",
+      "cat": "npc",
+      "domain": "wow"
+    },
+    {
+      "en": "Harpoon",
+      "ko": "작살",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Iceblade Flurry",
+      "ko": "질풍의 얼음칼날",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Kill Command",
+      "ko": "살상 명령",
+      "cat": "skill",
+      "pin": true,
+      "domain": "wow"
+    },
+    {
+      "en": "Kings' Rest",
+      "ko": "왕들의 안식처",
+      "cat": "place",
+      "note": "'왕의 안식처' 아님",
+      "domain": "wow"
+    },
+    {
+      "en": "Lethal Calibration",
+      "ko": "치명적 보정",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Lost Explorers",
+      "ko": "잃어버린 탐험가들",
+      "tentative": true,
+      "cat": "boss",
+      "note": "보스",
+      "domain": "wow"
+    },
+    {
+      "en": "Magister Umbric",
+      "ko": "마법학자 움브릭",
+      "cat": "npc",
+      "domain": "wow"
+    },
+    {
+      "en": "Mongoose Fury",
+      "ko": "살쾡이의 격노",
+      "cat": "skill",
+      "note": "'몽구스' 아님",
+      "domain": "wow"
+    },
+    {
+      "en": "Mongoose Rounds",
+      "ko": "살쾡이 탄환",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Nebulous Void Core",
+      "ko": "성운 공허 핵",
+      "tentative": true,
+      "cat": "item",
+      "note": "보너스 굴림 토큰",
+      "domain": "wow"
+    },
+    {
+      "en": "Nek'zali",
+      "ko": "네크잘리",
+      "cat": "boss",
+      "note": "'넥잘리' 아님",
+      "domain": "wow"
+    },
+    {
+      "en": "Nymrissa Wavecaller",
+      "ko": "님리사 웨이브콜러",
+      "cat": "boss",
+      "note": "npc 252959. 음차가 공식",
+      "domain": "wow"
+    },
+    {
+      "en": "Pack Leader",
+      "ko": "무리의 지도자",
+      "cat": "spec",
+      "note": "Hero talent",
+      "domain": "wow"
+    },
+    {
+      "en": "Sentinel",
+      "ko": "파수꾼",
+      "cat": "spec",
+      "note": "Hero talent",
+      "domain": "wow"
+    },
+    {
+      "en": "Sentinel's Mark",
+      "ko": "파수꾼의 표식",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Shell Shock",
+      "ko": "충격 회복 갑피",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Sszorak",
+      "ko": "스조라크",
+      "tentative": true,
+      "cat": "boss",
+      "domain": "wow"
+    },
+    {
+      "en": "Survival of the Fittest",
+      "ko": "적자생존",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Swirling Whirlpools",
+      "ko": "휘몰아치는 소용돌이",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Takedown",
+      "ko": "제압",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "The Coiled Altar",
+      "ko": "똬리의 제단",
+      "cat": "place",
+      "domain": "wow"
+    },
+    {
+      "en": "The Tidebound Grotto",
+      "ko": "해일결속 동굴",
+      "cat": "place",
+      "note": "zone 16671",
+      "domain": "wow"
+    },
+    {
+      "en": "The Venomous Abyss",
+      "ko": "맹독 심연",
+      "cat": "place",
+      "note": "zone 16915. '맹독의 심연' 아님",
+      "domain": "wow"
+    },
+    {
+      "en": "Trailblazer",
+      "ko": "개척자",
+      "cat": "spec",
+      "domain": "wow"
+    },
+    {
+      "en": "Ula'tek",
+      "ko": "울라텍",
+      "cat": "boss",
+      "domain": "wow"
+    },
+    {
+      "en": "Unending Tides",
+      "ko": "끝없는 해일",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Voidscar Arena",
+      "ko": "공허흉터 투기장",
+      "tentative": true,
+      "cat": "place",
+      "note": "미확정",
+      "domain": "wow"
+    },
+    {
+      "en": "Wavecaller's Seastone",
+      "ko": "웨이브콜러의 바다돌",
+      "tentative": true,
+      "cat": "item",
+      "domain": "wow"
+    },
+    {
+      "en": "Wildfire Bomb",
+      "ko": "야생불 폭탄",
+      "cat": "skill",
+      "domain": "wow"
+    },
+    {
+      "en": "Zul'jan",
+      "ko": "줄잔",
+      "cat": "boss",
+      "note": "절단기 드롭 보스",
+      "domain": "wow"
+    },
+    {
+      "en": "Zul'jan's Guillotine Technique",
+      "ko": "줄잔의 절단기 기법",
+      "tentative": true,
+      "cat": "item",
+      "note": "장신구. 임시 표기",
+      "domain": "wow"
+    }
+  ]
+}
