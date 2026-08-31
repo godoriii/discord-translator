@@ -1604,12 +1604,20 @@
       // attempts is carried as-is — never reset — so the single-item
       // failure paths in onResponse still fire.
       var mid = Math.ceil(batch.length / 2);
-      var a = batch.slice(0, mid), b = batch.slice(mid);
-      [a, b].forEach(function (part) {
-        if (!part.length) return;
-        part.forEach(function (it) { it.enqueuedAt = Util.now(); });
-        Queue._send(part);
-      });
+      var parts = [batch.slice(0, mid), batch.slice(mid)].filter(function (p) { return p.length; });
+      var sendParts = function () {
+        // Direct sends skip the queue, so honor the two queue-level gates
+        // ourselves: a disabled client must not fire requests (same silent
+        // drop as _stopAll), and a backoff pause must delay the halves.
+        if (!cfg.enabled) return;
+        var wait = (State.queue.pausedUntil || 0) - Util.now();
+        if (wait > 0) { setTimeout(sendParts, wait + 20); return; }
+        parts.forEach(function (part) {
+          part.forEach(function (it) { it.enqueuedAt = Util.now(); });
+          Queue._send(part);
+        });
+      };
+      sendParts();
     },
     _requeueSingle: function (item) {
       if ((item._partialRetries || 0) >= 1) { Queue._markFailed(item, 'partial'); return; }
