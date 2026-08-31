@@ -204,7 +204,7 @@
   var msgIdCounter = 1;
   function freshId() { return '30000000000' + String(msgIdCounter++).padStart(7, '0'); }
 
-  // ---- 35 scenarios ----------------------------------------------------------
+  // ---- 36 scenarios ----------------------------------------------------------
   var scenarios = [];
 
   function scenario(name, fn) { scenarios.push({ name: name, fn: fn }); }
@@ -777,6 +777,30 @@
     assertEq(filterCase.stop_reason, 'refusal', 'finish_reason content_filter -> refusal');
     assertEq(D.Api._fromOpenAI({ error: { message: 'boom' } }), null, '오류 응답은 null(원본 유지) 반환');
     assertEq(D.Api._fromOpenAI(null), null, 'null 안전');
+  });
+
+  scenario('36. effort 미지원 모델은 output_config 제외', async function () {
+    // 실 API 회귀(2026-09-01): claude-haiku-4-5는 effort를 지원하지 않아
+    // output_config를 보내면 400 "This model does not support the effort
+    // parameter"가 난다. 미지원 모델에서는 필드 자체가 빠져야 한다.
+    var D = DX();
+    var captured = null;
+    var orig = D.Api.request;
+    function mkItem(id, text) { return { msgId: id, kind: 'message', text: text, hash: 'h-' + id, placeholders: [], matches: [] }; }
+    resetState({ model: 'claude-haiku-4-5' });
+    D.Api.request = function (body) { captured = body; return orig.call(D.Api, body); };
+    try { await D.Api.translateBatch([mkItem('effA', 'effort guard test one')]); }
+    finally { D.Api.request = orig; }
+    assertTrue(!!captured, '요청이 만들어져야 함');
+    assertTrue(!('output_config' in captured), 'haiku 요청에는 output_config가 없어야 함');
+    assertEq(captured.model, 'claude-haiku-4-5', '모델 반영');
+
+    resetState({ model: 'claude-opus-5' });
+    captured = null;
+    D.Api.request = function (body) { captured = body; return orig.call(D.Api, body); };
+    try { await D.Api.translateBatch([mkItem('effB', 'effort guard test two')]); }
+    finally { D.Api.request = orig; }
+    assertTrue(!!captured && !!captured.output_config && captured.output_config.effort === 'low', '지원 모델에는 effort가 포함되어야 함');
   });
 
   // ---- runner ----------------------------------------------------------

@@ -42,7 +42,7 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
     --enable-logging=stderr --v=0 \
     "http://127.0.0.1:8899/test/harness.html?autorun=1" 2>&1 | grep DCXLT_SUMMARY
   ```
-  `DCXLT_SUMMARY pass=36 fail=0 skipped=0 xhr=0` 이 나와야 한다 (v0.2.0부터 36 = 시나리오 35 + 네트워크 어서션). (완주 후 크롬은 직접 kill)
+  `DCXLT_SUMMARY pass=37 fail=0 skipped=0 xhr=0` 이 나와야 한다 (v0.2.0부터 37 = 시나리오 36 + 네트워크 어서션). (완주 후 크롬은 직접 kill)
   - 참고: `--virtual-time-budget`은 영구 setInterval과 상극이라 여전히 금지. 위처럼 실시간 타이머 + 스로틀링 비활성 플래그로 돌린다.
   - 하네스 디버그 파라미터: `&only=3,17,28`(부분 실행), `&spy=1`(큐 이벤트 `DCXLT_TRACE` 콘솔 트레이스), 완주 시 `DCXLT_RESULTS <json>` 콘솔 라인으로 시나리오별 결과 수집 가능.
 - 포그라운드 브라우저에서 보고 싶으면: `http://127.0.0.1:8899/test/harness.html` 을 **화면에 보이는 탭**으로 열고 `await __DCXLT_TEST__.runAll()`. (hidden 탭은 타이머 스로틀링 때문에 타이밍 시나리오가 가짜로 실패한다 — 이전 세션의 "백그라운드 28/34"가 그것)

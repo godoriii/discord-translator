@@ -90,6 +90,10 @@
       'claude-opus-5': [5, 25], 'claude-sonnet-5': [2, 10], 'claude-haiku-4-5': [1, 5],
       'claude-opus-4-8': [5, 25], 'claude-fable-5': [10, 50]
     },
+    // effort(output_config)를 지원하지 않는 모델. 여기에 있는 모델로는
+    // output_config를 아예 보내지 않는다 — 보내면 API가
+    // "This model does not support the effort parameter"로 400을 낸다.
+    EFFORT_UNSUPPORTED: ['claude-haiku-4-5'],
     PH_OPEN: '{{', PH_CLOSE: '}}'
   };
 
@@ -1407,9 +1411,11 @@
         model: cfg.model,
         max_tokens: cfg.maxTokens,
         system: Api.buildSystem(matchesUnion, tier),
-        messages: [{ role: 'user', content: Api.buildUser(batch, matchesUnion) }],
-        output_config: { effort: cfg.effort }
+        messages: [{ role: 'user', content: Api.buildUser(batch, matchesUnion) }]
       };
+      if (C.EFFORT_UNSUPPORTED.indexOf(cfg.model) === -1) {
+        body.output_config = { effort: cfg.effort };
+      }
       return Api.request(body);
     },
     parseResponse: function (json) {
