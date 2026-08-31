@@ -1267,7 +1267,14 @@
     },
     request: function (body) {
       return new Promise(function (resolve) {
-        if (cfg.mockApi && cfg.mockApi !== 'off') { resolve(MockApi.handle(body)); return; }
+        if (cfg.mockApi && cfg.mockApi !== 'off') {
+          // Must resolve on a macrotask, never synchronously: a retrying
+          // request cycle (requeue/bisect) otherwise runs as one unyielding
+          // microtask chain that starves timers and rendering — the real
+          // network path always yields, and the mock has to match that.
+          setTimeout(function () { resolve(MockApi.handle(body)); }, 0);
+          return;
+        }
         if (!GM.xhr) { resolve({ status: 0, error: 'no-gm-xhr' }); return; }
         var headers = {
           'content-type': 'application/json',
@@ -1588,12 +1595,21 @@
       setTimeout(function () { Queue._requeueSameBatch(batch); Queue.tick(); }, delay);
     },
     _bisect: function (batch) {
+      // The halves must NOT go back through the queue: tick()'s packer
+      // would immediately re-merge them into the very batch that just
+      // failed, and the old attempts reset kept that requeue↔bisect cycle
+      // from ever reaching an exit condition (an unbounded retry loop).
+      // Direct sends keep the halves separate, so every bisection level
+      // strictly shrinks the batch and the cycle terminates at singles.
+      // attempts is carried as-is — never reset — so the single-item
+      // failure paths in onResponse still fire.
       var mid = Math.ceil(batch.length / 2);
       var a = batch.slice(0, mid), b = batch.slice(mid);
       [a, b].forEach(function (part) {
-        part.forEach(function (it) { it.attempts = 0; it.enqueuedAt = Util.now(); it.seq = State.queue.seq++; State.queue.queued.push(it); });
+        if (!part.length) return;
+        part.forEach(function (it) { it.enqueuedAt = Util.now(); });
+        Queue._send(part);
       });
-      Queue.tick();
     },
     _requeueSingle: function (item) {
       if ((item._partialRetries || 0) >= 1) { Queue._markFailed(item, 'partial'); return; }
