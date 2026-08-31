@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Inline Translator (KO)
 // @namespace    https://github.com/godoriii/discord-translator
-// @version      0.1.2
+// @version      0.2.0
 // @description  디스코드 웹 채팅을 사용자 용어집 기반으로 한국어 인라인 번역
 // @match        https://discord.com/*
 // @match        https://ptb.discord.com/*
@@ -18,6 +18,12 @@
 // @connect      api.anthropic.com
 // @connect      raw.githubusercontent.com
 // @connect      gist.githubusercontent.com
+// @connect      generativelanguage.googleapis.com
+// @connect      api.openai.com
+// @connect      openrouter.ai
+// @connect      api.groq.com
+// @connect      localhost
+// @connect      127.0.0.1
 // @updateURL    https://raw.githubusercontent.com/godoriii/discord-translator/main/discord-inline-translate.user.js
 // @downloadURL  https://raw.githubusercontent.com/godoriii/discord-translator/main/discord-inline-translate.user.js
 // ==/UserScript==
@@ -25,7 +31,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '0.1.2';
+  var SCRIPT_VERSION = '0.2.0';
 
   // ===== 1. CONSTANTS =====
   var C = {
@@ -90,6 +96,7 @@
   var StoreKeys = {
     settings: C.NS + '.settings.v1',
     apiKey: C.NS + '.apiKey',
+    customApiKey: C.NS + '.customApiKey',
     glossaryRemote: C.NS + '.glossary.remote.v1',
     glossaryLocal: C.NS + '.glossary.local.v1',
     tcache: C.NS + '.tcache.v1',
@@ -104,6 +111,14 @@
     model: 'claude-opus-5',
     effort: 'low',
     maxTokens: 4096,
+
+    // 번역 API 프로바이더. 'anthropic'(기본) 또는 'openai'(OpenAI 호환
+    // chat/completions — Gemini/OpenRouter/Groq/Ollama/OpenAI 등 Base URL만
+    // 바꿔 어떤 호환 API든 연결).
+    provider: 'anthropic',
+    customBaseUrl: '',
+    customModel: '',
+    customHeaders: '',
     targetLang: 'ko',
     targetLangName: '한국어',
 
@@ -141,6 +156,7 @@
   var cfg = null;
   var State = {
     apiKey: '',
+    customApiKey: '',
     glossary: {
       remote: { url: '', etag: '', lastModified: '', fetchedAt: 0, rev: '', entries: [] },
       local: { entries: [] },
@@ -257,6 +273,7 @@
       cfg = Object.assign({}, DEFAULTS, stored || {});
       cfg.schema = DEFAULTS.schema;
       State.apiKey = Store.getApiKey();
+      State.customApiKey = Store.get(StoreKeys.customApiKey, '') || '';
       TCache._load();
       Store._loadStats();
       return cfg;
@@ -283,6 +300,7 @@
     },
     getApiKey: function () { return Store.get(StoreKeys.apiKey, '') || ''; },
     setApiKey: function (str) { State.apiKey = str || ''; Store.set(StoreKeys.apiKey, str || ''); },
+    setCustomApiKey: function (str) { State.customApiKey = str || ''; Store.set(StoreKeys.customApiKey, str || ''); },
     exportSettings: function () {
       var c = Object.assign({}, cfg);
       return JSON.stringify(c, null, 2);
@@ -1270,6 +1288,52 @@
       lines.push(JSON.stringify({ items: items }));
       return lines.join('\n');
     },
+    // ---- OpenAI 호환 프로바이더 어댑터 --------------------------------
+    // 내부 표현은 Anthropic Messages 형식 하나로 유지하고(mock/파서/큐가
+    // 전부 그 형식을 전제), 전송 직전/수신 직후에만 변환한다. 변환 함수는
+    // 순수 함수로 유지해 하네스가 네트워크 없이 검증한다(§9-34/35).
+    _openaiUrl: function () {
+      var base = String(cfg.customBaseUrl || '').replace(/\/+$/, '');
+      return base ? base + '/chat/completions' : '';
+    },
+    _flattenSystem: function (system) {
+      if (typeof system === 'string') return system;
+      return (system || []).map(function (b) { return (b && b.text) || ''; }).join('\n\n');
+    },
+    _toOpenAI: function (body) {
+      // cache_control 등 Anthropic 전용 필드는 여기서 자연히 떨어져 나간다
+      // (system 블록을 텍스트로 평탄화). output_config/effort도 비호환이라
+      // 전송하지 않는다.
+      return {
+        model: cfg.customModel || body.model,
+        max_tokens: body.max_tokens,
+        messages: [
+          { role: 'system', content: Api._flattenSystem(body.system) },
+          { role: 'user', content: body.messages[0].content }
+        ]
+      };
+    },
+    _fromOpenAI: function (json) {
+      // 성공 응답(choices 있음)만 Anthropic 형식으로 정규화한다. 오류
+      // 응답({error:{...}})은 null을 돌려 호출부가 원본을 그대로 쓰게 한다
+      // — onResponse의 fatal 분기가 error.message를 읽는 형식이 동일하다.
+      if (!json || !Array.isArray(json.choices) || !json.choices.length) return null;
+      var choice = json.choices[0];
+      var finish = choice.finish_reason;
+      var stop = finish === 'length' ? 'max_tokens' : (finish === 'content_filter' ? 'refusal' : 'end_turn');
+      var u = json.usage || {};
+      var cached = (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || 0;
+      return {
+        stop_reason: stop,
+        content: [{ type: 'text', text: (choice.message && choice.message.content) || '' }],
+        usage: {
+          input_tokens: Math.max(0, (u.prompt_tokens || 0) - cached),
+          output_tokens: u.completion_tokens || 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: cached
+        }
+      };
+    },
     request: function (body) {
       return new Promise(function (resolve) {
         if (cfg.mockApi && cfg.mockApi !== 'off') {
@@ -1281,6 +1345,31 @@
           return;
         }
         if (!GM.xhr) { resolve({ status: 0, error: 'no-gm-xhr' }); return; }
+        if (cfg.provider === 'openai') {
+          var oUrl = Api._openaiUrl();
+          if (!oUrl) { resolve({ status: 0, error: 'no-base-url' }); return; }
+          var oHeaders = { 'content-type': 'application/json' };
+          if (State.customApiKey) oHeaders['authorization'] = 'Bearer ' + State.customApiKey;
+          var extra = Util.safeJsonParse(cfg.customHeaders || '');
+          if (extra.ok && extra.value && typeof extra.value === 'object' && !Array.isArray(extra.value)) {
+            Object.assign(oHeaders, extra.value);
+          }
+          GM.xhr({
+            method: 'POST',
+            url: oUrl,
+            headers: oHeaders,
+            data: JSON.stringify(Api._toOpenAI(body)),
+            timeout: 30000,
+            onload: function (res) {
+              var j = Util.safeJsonParse(res.responseText);
+              var normalized = j.ok ? (Api._fromOpenAI(j.value) || j.value) : null;
+              resolve({ status: res.status, headers: res.responseHeaders, json: normalized, raw: res.responseText });
+            },
+            onerror: function () { resolve({ status: 0, error: 'network' }); },
+            ontimeout: function () { resolve({ status: 0, error: 'timeout' }); }
+          });
+          return;
+        }
         var headers = {
           'content-type': 'application/json',
           'x-api-key': State.apiKey,
@@ -1359,7 +1448,10 @@
       State.stats.cw += usage.cache_creation_input_tokens || 0;
       State.stats.cr += usage.cache_read_input_tokens || 0;
       Store.saveStats();
-      if ((usage.cache_creation_input_tokens > 0 || usage.cache_read_input_tokens > 0) && State.queue.currentConcurrency < C.MAX_CONCURRENT) {
+      // 캐시 히트가 관측되면 동시성을 올린다. 커스텀 프로바이더는 캐시
+      // 토큰을 보고하지 않는 곳이 많으므로, 정상 응답이 오기 시작한 것
+      // 자체를 승격 신호로 삼는다.
+      if ((cfg.provider === 'openai' || usage.cache_creation_input_tokens > 0 || usage.cache_read_input_tokens > 0) && State.queue.currentConcurrency < C.MAX_CONCURRENT) {
         State.queue.currentConcurrency = C.MAX_CONCURRENT;
       }
     }
@@ -1867,6 +1959,12 @@
         '.small{font-size:11px;color:#949ba4}' +
         '.probe-result{font-size:11px;margin-top:4px;color:#a3c9a3}';
     },
+    PROVIDER_PRESETS: {
+      gemini: { baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-3.7-flash' },
+      openrouter: { baseUrl: 'https://openrouter.ai/api/v1', model: 'google/gemini-3.7-flash' },
+      groq: { baseUrl: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
+      ollama: { baseUrl: 'http://127.0.0.1:11434/v1', model: 'llama3.1' }
+    },
     _panelHtml: function () {
       return '<div class="modal" style="position:relative">' +
         '<button class="close" data-act="close">✕</button>' +
@@ -1877,6 +1975,11 @@
         '<div class="tab" data-tab="진단">진단</div>' +
         '</div>' +
         '<div class="panel" data-panel="일반">' +
+        '<label>프로바이더</label><select data-f="provider">' +
+        '<option value="anthropic">Anthropic (기본)</option>' +
+        '<option value="openai">커스텀 — OpenAI 호환 (Gemini/OpenRouter/Groq/Ollama 등)</option>' +
+        '</select>' +
+        '<div data-el="anthropicFields">' +
         '<label>Anthropic API 키</label><input type="password" data-f="apiKey">' +
         '<label>모델</label><select data-f="model">' +
         '<option value="claude-opus-5">claude-opus-5 (캐시 최소 512토큰)</option>' +
@@ -1884,6 +1987,20 @@
         '<option value="claude-haiku-4-5">claude-haiku-4-5 (캐시 최소 4096토큰)</option>' +
         '</select>' +
         '<div class="small" data-el="cacheWarn"></div>' +
+        '</div>' +
+        '<div data-el="customFields" style="display:none">' +
+        '<div class="small">프리셋: ' +
+        '<button data-preset="gemini">Gemini</button>' +
+        '<button data-preset="openrouter">OpenRouter</button>' +
+        '<button data-preset="groq">Groq</button>' +
+        '<button data-preset="ollama">Ollama(로컬)</button>' +
+        '</div>' +
+        '<label>Base URL (끝의 /chat/completions 는 자동으로 붙음)</label><input type="text" data-f="customBaseUrl" placeholder="https://generativelanguage.googleapis.com/v1beta/openai">' +
+        '<label>모델명</label><input type="text" data-f="customModel" placeholder="gemini-3.7-flash">' +
+        '<label>API 키</label><input type="password" data-f="customApiKey">' +
+        '<label>추가 헤더 (JSON, 선택)</label><textarea data-f="customHeaders" placeholder=\'{"HTTP-Referer": "https://example.com"}\'></textarea>' +
+        '<div class="small">목록에 없는 도메인은 첫 요청 때 Tampermonkey가 접근 허용을 물어봅니다.</div>' +
+        '</div>' +
         '<label><input type="checkbox" data-f="enabled"> 번역 활성화</label>' +
         '<label><input type="checkbox" data-f="autoTranslate"> 자동번역</label>' +
         '<label><input type="checkbox" data-f="translateEmbeds"> 임베드 번역</label>' +
@@ -1916,9 +2033,31 @@
       var tabs = shadow.querySelectorAll('.tab');
       tabs.forEach(function (t) { t.addEventListener('click', function () { UI._selectTab(t.getAttribute('data-tab')); }); });
       shadow.querySelector('[data-act="close"]').addEventListener('click', UI.closeSettings);
+      shadow.querySelector('[data-f="provider"]').addEventListener('change', function () {
+        UI._toggleProviderFields(shadow);
+      });
+      shadow.querySelectorAll('[data-preset]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          var p = UI.PROVIDER_PRESETS[btn.getAttribute('data-preset')];
+          if (!p) return;
+          shadow.querySelector('[data-f="customBaseUrl"]').value = p.baseUrl;
+          shadow.querySelector('[data-f="customModel"]').value = p.model;
+        });
+      });
       shadow.querySelector('[data-act="save-general"]').addEventListener('click', function () {
+        var headersText = shadow.querySelector('[data-f="customHeaders"]').value.trim();
+        if (headersText) {
+          var hr = Util.safeJsonParse(headersText);
+          if (!hr.ok || !hr.value || typeof hr.value !== 'object' || Array.isArray(hr.value)) {
+            Render.toast('추가 헤더가 올바른 JSON 객체가 아닙니다');
+            return;
+          }
+        }
         var patch = {
-          apiKey: undefined,
+          provider: shadow.querySelector('[data-f="provider"]').value,
+          customBaseUrl: shadow.querySelector('[data-f="customBaseUrl"]').value.trim(),
+          customModel: shadow.querySelector('[data-f="customModel"]').value.trim(),
+          customHeaders: headersText,
           model: shadow.querySelector('[data-f="model"]').value,
           enabled: shadow.querySelector('[data-f="enabled"]').checked,
           autoTranslate: shadow.querySelector('[data-f="autoTranslate"]').checked,
@@ -1928,7 +2067,8 @@
         };
         var key = shadow.querySelector('[data-f="apiKey"]').value;
         if (key) Store.setApiKey(key);
-        delete patch.apiKey;
+        var customKey = shadow.querySelector('[data-f="customApiKey"]').value;
+        if (customKey) Store.setCustomApiKey(customKey);
         Store.saveSettings(patch);
         Render.setGlobalHidden(!cfg.enabled);
         UI._refreshCacheWarn(shadow);
@@ -1973,7 +2113,17 @@
       });
       UI._fillFromCfg(shadow);
     },
+    _toggleProviderFields: function (shadow) {
+      var isCustom = shadow.querySelector('[data-f="provider"]').value === 'openai';
+      shadow.querySelector('[data-el="anthropicFields"]').style.display = isCustom ? 'none' : '';
+      shadow.querySelector('[data-el="customFields"]').style.display = isCustom ? '' : 'none';
+    },
     _fillFromCfg: function (shadow) {
+      shadow.querySelector('[data-f="provider"]').value = cfg.provider || 'anthropic';
+      shadow.querySelector('[data-f="customBaseUrl"]').value = cfg.customBaseUrl || '';
+      shadow.querySelector('[data-f="customModel"]').value = cfg.customModel || '';
+      shadow.querySelector('[data-f="customHeaders"]').value = cfg.customHeaders || '';
+      UI._toggleProviderFields(shadow);
       shadow.querySelector('[data-f="model"]').value = cfg.model;
       shadow.querySelector('[data-f="enabled"]').checked = cfg.enabled;
       shadow.querySelector('[data-f="autoTranslate"]').checked = cfg.autoTranslate;
@@ -1987,6 +2137,7 @@
     },
     _refreshCacheWarn: function (shadow) {
       var el = shadow.querySelector('[data-el="cacheWarn"]');
+      if (cfg.provider === 'openai') { el.textContent = ''; return; }
       var min = C.CACHE_MIN_TOKENS[cfg.model] || 0;
       var estRule = Util.estTokens(RULE_TEMPLATE) + Util.estTokens(Glossary.inlineBlock(Glossary.tier()));
       if (estRule < min) el.textContent = '이 모델에서는 프롬프트 캐시가 걸리지 않습니다 (추정 ' + Math.round(estRule) + '토큰 < ' + min + '토큰)';

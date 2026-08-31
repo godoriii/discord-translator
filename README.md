@@ -41,6 +41,19 @@ Tampermonkey 사용자 스크립트로 Discord 웹 클라이언트에서 메시�
 
 **Prompt Cache**: 용어집은 캐시되어 캐시 읽기는 입력가의 **10%** 청구. Opus 5는 512토큰부터 캐시, Haiku 4.5는 4096토큰 미만이면 캐시 미적용.
 
+### 커스텀 프로바이더 (v0.2.0+) — Gemini 무료 티어 등
+
+Anthropic 대신 **OpenAI 호환 chat/completions API라면 무엇이든** 연결할 수 있습니다 (Gemini, OpenRouter, Groq, Ollama 로컬, OpenAI 등).
+
+1. 설정 패널 → **일반** 탭 → 프로바이더에서 **커스텀 — OpenAI 호환** 선택.
+2. 프리셋 버튼(Gemini / OpenRouter / Groq / Ollama)을 누르면 Base URL과 모델명이 채워집니다. 다른 API는 직접 입력 — Base URL은 `/chat/completions` 앞부분까지만 적으면 됩니다.
+3. 해당 프로바이더의 API 키 입력 후 **저장**.
+   - Gemini 무료 티어: [Google AI Studio](https://aistudio.google.com/apikey)에서 카드 등록 없이 키 발급. Flash 계열 모델이 분당 10회·일 250~1,500회 무료.
+   - 인증 헤더가 특이한 API는 "추가 헤더(JSON)"에 직접 지정 (기본은 `Authorization: Bearer <키>`).
+4. 프리셋에 없는 도메인은 첫 요청 때 Tampermonkey가 접근 허용을 물어봅니다 — 허용해 주세요.
+
+참고: Anthropic 프롬프트 캐시 할인·`effort` 설정은 Anthropic 프로바이더에만 적용됩니다. 용어집 강제는 프롬프트 기반이라 어떤 프로바이더에서도 동일하게 동작합니다.
+
 ---
 
 ## 3. 용어집
