@@ -112,6 +112,14 @@
     d.State.queue.queued = [];
     d.State.queue._inflightBatches = [];
     d.State.queue.inflightCount = 0;
+    // Cancel pending backoff retries from the previous scenario — an
+    // orphaned _scheduleRetry timer fires mid-scenario and injects a stale
+    // batch into the freshly reset queue (observed: scenario 17's retry
+    // timer polluting scenario 28's request counting).
+    if (d.State.queue.retryTimers) {
+      d.State.queue.retryTimers.forEach(function (t) { clearTimeout(t); });
+      d.State.queue.retryTimers.clear();
+    }
     d.State.queue.failed.clear();
     d.State.queue.pausedUntil = 0;
     d.State.queue.consecutiveRateLimits = 0;
@@ -148,6 +156,16 @@
     var root = chatRootEl();
     var li = window.Fixtures.mkMessage(Object.assign({ channelId: CH }, opts));
     root.appendChild(li);
+    // Real Discord keeps the list pinned to the bottom when new messages
+    // arrive while the user is at the bottom — decidePriority's nearBottom
+    // check assumes exactly that. Without this pin, appended content that
+    // outgrows the scroller's fixed 400px height silently flips nearBottom
+    // to false and live messages stop auto-translating (scenario 3+).
+    // Scenarios that need an away-from-bottom position (e.g. 23) overwrite
+    // scrollTop AFTER adding their messages, so an unconditional pin here
+    // stays correct for them too.
+    var sc = root.closest('div[class*="scroller_"]');
+    if (sc) sc.scrollTop = sc.scrollHeight;
     return li;
   }
 
@@ -717,6 +735,39 @@
   // ---- runner ----------------------------------------------------------
   var RUNNING_UNDER_AUTORUN = /(?:^|[?&])autorun=1(?:&|$)/.test(location.search);
 
+  // Debug helpers for headless capture, both read from the ORIGINAL query
+  // string (replaceState wipes location.search before we get here):
+  //   ?only=3,17,28  -> run just those scenario numbers, SKIP the rest
+  //   ?spy=1         -> log queue/mock events as DCXLT_TRACE console lines
+  var HARNESS_QUERY = function () { return window.__DCXLT_ORIGINAL_SEARCH__ || location.search; };
+  var ONLY_IDS = (function () {
+    var m = HARNESS_QUERY().match(/(?:^|[?&])only=([\d,]+)/);
+    return m ? m[1].split(',').map(Number) : null;
+  })();
+  var SPY_ON = /(?:^|[?&])spy=1(?:&|$)/.test(HARNESS_QUERY());
+
+  function installQueueSpy() {
+    var d = DX();
+    var t0 = Date.now();
+    function log(name, extra) { console.log('DCXLT_TRACE ' + (Date.now() - t0) + 'ms ' + name + (extra ? ' ' + extra : '')); }
+    function spy(obj, name, fmt) {
+      var orig = obj[name];
+      if (typeof orig !== 'function') return;
+      obj[name] = function () {
+        try { log(name, fmt ? fmt.apply(null, arguments) : ''); } catch (e) { /* spy must never break the run */ }
+        return orig.apply(this, arguments);
+      };
+    }
+    spy(d.Queue, 'enqueue', function (it, p) { return 'msg=' + it.msgId + ' pri=' + p; });
+    spy(d.Queue, '_send', function (b) { return 'n=' + b.length + ' att=' + (b[0] && b[0].attempts); });
+    spy(d.Queue, 'onResponse', function (b, res) { return 'status=' + res.status; });
+    spy(d.Queue, '_scheduleRetry', function (b, delay) { return 'delay=' + Math.round(delay); });
+    spy(d.Queue, '_requeueSameBatch', function (b) { return 'att->' + (((b[0] && b[0].attempts) || 0) + 1); });
+    spy(d.Queue, '_bisect', function (b) { return 'n=' + b.length; });
+    spy(d.Queue, '_markFailed', function (it, reason) { return 'msg=' + (it && it.msgId) + ' reason=' + reason; });
+    spy(d.MockApi, 'handle', function () { return 'mode=' + d.cfg.mockApi + ' manual=' + d.MockApi._manualRetryFlag; });
+  }
+
   async function runAll() {
     // Synchronous marker, written before any await: lets a mid-run DOM
     // capture distinguish "runAll() was never invoked" from "invoked but
@@ -738,9 +789,15 @@
       finish(reporter);
       return reporter.results;
     }
+    if (SPY_ON) installQueueSpy();
     for (var i = 0; i < scenarios.length; i++) {
       var s = scenarios[i];
+      if (ONLY_IDS && ONLY_IDS.indexOf(i + 1) === -1) {
+        reporter.record(i + 1, s.name, 'SKIPPED', 0, '');
+        continue;
+      }
       var ts = Date.now();
+      if (SPY_ON) console.log('DCXLT_TRACE === scenario ' + (i + 1) + ' ' + s.name);
       document.documentElement.setAttribute('data-dcxlt-progress', (i + 1) + '/' + scenarios.length);
       try {
         await s.fn();
@@ -793,6 +850,9 @@
     pre.textContent = JSON.stringify(payload, null, 1);
     pre.setAttribute('data-done', '1');
     console.log('DCXLT_SUMMARY pass=' + summary.pass + ' fail=' + summary.fail + ' skipped=' + summary.skipped + ' xhr=' + summary.xhrCount);
+    // Full per-scenario payload on one line for headless capture
+    // (--enable-logging=stderr), where the hidden <pre> is unreachable.
+    console.log('DCXLT_RESULTS ' + JSON.stringify(payload));
   }
 
   function renderReport(reporter) {
