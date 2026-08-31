@@ -1941,6 +1941,16 @@
       host.style.zIndex = '2147483647';
       host.style.inset = '0';
       document.body.appendChild(host);
+      // Discord는 document 레벨 keydown에서 "편집 가능한 요소가 포커스돼
+      // 있지 않으면" 채팅 입력창으로 포커스를 옮기고 키를 가져간다.
+      // Shadow DOM 안의 우리 입력칸은 리타게팅 때문에 document에서는
+      // 이 host <div>로만 보여 편집 요소로 인식되지 않으므로, 패널에서
+      // 시작된 키보드·IME·클립보드 이벤트는 여기서 전파를 끊어 디스코드
+      // 핸들러(그리고 우리 Alt+T 전역 단축키)에 도달하지 못하게 한다.
+      ['keydown', 'keyup', 'keypress', 'input', 'paste', 'cut', 'copy',
+        'compositionstart', 'compositionupdate', 'compositionend'].forEach(function (type) {
+        host.addEventListener(type, function (e) { e.stopPropagation(); });
+      });
       var shadow = host.attachShadow({ mode: 'open' });
       UI._root = host;
       UI._shadow = shadow;
