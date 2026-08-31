@@ -303,8 +303,10 @@
       }
     },
     getApiKey: function () { return Store.get(StoreKeys.apiKey, '') || ''; },
-    setApiKey: function (str) { State.apiKey = str || ''; Store.set(StoreKeys.apiKey, str || ''); },
-    setCustomApiKey: function (str) { State.customApiKey = str || ''; Store.set(StoreKeys.customApiKey, str || ''); },
+    // 붙여넣기에 섞여 들어오는 공백/줄바꿈은 그대로 저장하면 인증 헤더가
+    // 통째로 깨져 401이 난다 — 저장 시점에 항상 trim.
+    setApiKey: function (str) { var v = String(str || '').trim(); State.apiKey = v; Store.set(StoreKeys.apiKey, v); },
+    setCustomApiKey: function (str) { var v = String(str || '').trim(); State.customApiKey = v; Store.set(StoreKeys.customApiKey, v); },
     exportSettings: function () {
       var c = Object.assign({}, cfg);
       return JSON.stringify(c, null, 2);
@@ -1680,7 +1682,8 @@
           cfg.enabled = false;
           Store.saveSettings({ enabled: false });
           Queue._stopAll();
-          Render.toast('API 키가 거부되었습니다.', [{ label: '설정 열기', fn: function () { UI.openSettings('일반'); } }]);
+          var authDetail = (res.json && res.json.error && res.json.error.message) ? (' (' + String(res.json.error.message).slice(0, 120) + ')') : '';
+          Render.toast('API 키가 거부되었습니다' + authDetail, [{ label: '설정 열기', fn: function () { UI.openSettings('일반'); } }]);
           UI.openSettings('일반');
           break;
         }
