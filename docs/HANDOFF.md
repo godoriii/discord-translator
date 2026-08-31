@@ -42,7 +42,7 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
     --enable-logging=stderr --v=0 \
     "http://127.0.0.1:8899/test/harness.html?autorun=1" 2>&1 | grep DCXLT_SUMMARY
   ```
-  `DCXLT_SUMMARY pass=34 fail=0 skipped=0 xhr=0` 이 나와야 한다. (완주 후 크롬은 직접 kill)
+  `DCXLT_SUMMARY pass=37 fail=0 skipped=0 xhr=0` 이 나와야 한다 (v0.2.0부터 37 = 시나리오 36 + 네트워크 어서션). (완주 후 크롬은 직접 kill)
   - 참고: `--virtual-time-budget`은 영구 setInterval과 상극이라 여전히 금지. 위처럼 실시간 타이머 + 스로틀링 비활성 플래그로 돌린다.
   - 하네스 디버그 파라미터: `&only=3,17,28`(부분 실행), `&spy=1`(큐 이벤트 `DCXLT_TRACE` 콘솔 트레이스), 완주 시 `DCXLT_RESULTS <json>` 콘솔 라인으로 시나리오별 결과 수집 가능.
 - 포그라운드 브라우저에서 보고 싶으면: `http://127.0.0.1:8899/test/harness.html` 을 **화면에 보이는 탭**으로 열고 `await __DCXLT_TEST__.runAll()`. (hidden 탭은 타이머 스로틀링 때문에 타이밍 시나리오가 가짜로 실패한다 — 이전 세션의 "백그라운드 28/34"가 그것)
@@ -51,6 +51,10 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
 ## 남은 개선 아이디어 (선택)
 - max_tokens 다항목 배치를 태우는 mock 모드 + 시나리오 추가 (현재 스위트는 이 경로를 다항목으로 커버하지 않음 — Opus 분석 지적)
 - `_bisect` 직접 전송은 이분할 순간에 동시성 한도를 일시 초과할 수 있음(최대 BATCH_MAX_ITEMS=8, 유계). 문제되면 큐 기반 + 재병합 차단(maxBatch 태그) 방식으로 교체 검토.
+
+## v0.2.0 — 커스텀 프로바이더 (2026-09-01)
+
+Anthropic 외에 **OpenAI 호환 chat/completions API 전부**(Gemini/OpenRouter/Groq/Ollama/OpenAI …)를 설정 패널에서 연결 가능. 내부 표현은 Anthropic 형식 그대로 두고 `Api._toOpenAI`/`_fromOpenAI` 순수 변환 함수로 전송/수신만 어댑팅 — mock·파서·큐 로직 무변경. 프리셋 4종(설정 → 일반 → 프로바이더), 커스텀 키는 `dcxlt.customApiKey`에 별도 저장, `@connect`에 주요 도메인 추가(그 외 도메인은 TM이 첫 요청 때 물어봄). 하네스 시나리오 34·35가 변환 함수를 검증.
 
 ## 진행 로그
 - 08-31 18:40 GitHub 공개 리포 생성·초기 스냅샷 푸시 (사용자 승인)

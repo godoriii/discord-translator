@@ -56,7 +56,8 @@
     glossaryStrategy: 'auto', glossaryAudit: true,
     cacheTtl: '1h', translateEmbeds: true, backfillMode: 'viewport', contextMessages: 3,
     showOriginal: true, hotkeyToggle: 'Alt+KeyT', hotkeyTranslateView: 'Alt+Shift+KeyT', perChannelOff: [],
-    fontScale: 0.875, debug: true, mockApi: 'ok'
+    fontScale: 0.875, debug: true, mockApi: 'ok',
+    provider: 'anthropic', customBaseUrl: '', customModel: '', customHeaders: ''
   };
 
   gmStorage['dcxlt.settings.v1'] = Object.assign({}, BASE_SETTINGS);
@@ -203,7 +204,7 @@
   var msgIdCounter = 1;
   function freshId() { return '30000000000' + String(msgIdCounter++).padStart(7, '0'); }
 
-  // ---- 33 scenarios ----------------------------------------------------------
+  // ---- 36 scenarios ----------------------------------------------------------
   var scenarios = [];
 
   function scenario(name, fn) { scenarios.push({ name: name, fn: fn }); }
@@ -730,6 +731,76 @@
     assertEq(tier, 'matched', '대규모 용어집은 matched여야 함(추정 ' + Math.round(DX().Util.estTokens(DX().Glossary.entries.map(function(e){return e.en+' → '+e.ko;}).join('\n'))) + ' 토큰)');
     var block = DX().Glossary.inlineBlock('matched');
     assertTrue(block.indexOf('그 외 용어는') !== -1, 'matched tier에서는 pin/trailer 안내만 인라인되어야 함');
+  });
+
+  scenario('34. OpenAI 호환 프로바이더 요청 변환 (_toOpenAI)', function () {
+    resetState({ provider: 'openai', customBaseUrl: 'https://example.com/v1/', customModel: 'gemini-3.7-flash' });
+    var D = DX();
+    var body = {
+      model: 'claude-opus-5',
+      max_tokens: 4096,
+      system: [
+        { type: 'text', text: 'RULE_BLOCK', cache_control: { type: 'ephemeral', ttl: '1h' } },
+        { type: 'text', text: 'EXTRA_BLOCK' }
+      ],
+      messages: [{ role: 'user', content: 'USER_PROMPT' }],
+      output_config: { effort: 'low' }
+    };
+    var o = D.Api._toOpenAI(body);
+    assertEq(o.model, 'gemini-3.7-flash', 'customModel이 모델명으로 쓰여야 함');
+    assertEq(o.max_tokens, 4096, 'max_tokens 전달');
+    assertEq(o.messages.length, 2, 'system+user 2개 메시지여야 함');
+    assertEq(o.messages[0].role, 'system', '첫 메시지는 system');
+    assertTrue(o.messages[0].content.indexOf('RULE_BLOCK') !== -1 && o.messages[0].content.indexOf('EXTRA_BLOCK') !== -1, 'system 블록들이 평탄화되어 합쳐져야 함');
+    assertEq(o.messages[1].content, 'USER_PROMPT', 'user 프롬프트 전달');
+    var raw = JSON.stringify(o);
+    assertTrue(raw.indexOf('cache_control') === -1, 'Anthropic 전용 cache_control이 제거되어야 함');
+    assertTrue(raw.indexOf('output_config') === -1, 'output_config가 전송되면 안 됨');
+    assertEq(D.Api._openaiUrl(), 'https://example.com/v1/chat/completions', 'Base URL 끝 슬래시 정규화 + /chat/completions');
+  });
+
+  scenario('35. OpenAI 호환 응답 정규화 (_fromOpenAI)', function () {
+    resetState();
+    var D = DX();
+    var ok = D.Api._fromOpenAI({
+      choices: [{ message: { content: '{"translations":[{"i":0,"ko":"안녕","src":"en","skip":false}]}' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 40 } }
+    });
+    assertEq(ok.stop_reason, 'end_turn', 'finish_reason stop -> end_turn');
+    assertEq(ok.usage.input_tokens, 60, 'prompt_tokens에서 캐시분 제외');
+    assertEq(ok.usage.cache_read_input_tokens, 40, 'cached_tokens -> cache_read');
+    var parsed = D.Api.parseResponse(ok);
+    assertTrue(parsed.ok && parsed.translations.length === 1 && parsed.translations[0].ko === '안녕', '정규화된 응답이 기존 파서를 그대로 통과해야 함');
+    var lenCase = D.Api._fromOpenAI({ choices: [{ message: { content: '' }, finish_reason: 'length' }], usage: {} });
+    assertEq(lenCase.stop_reason, 'max_tokens', 'finish_reason length -> max_tokens');
+    var filterCase = D.Api._fromOpenAI({ choices: [{ message: { content: '' }, finish_reason: 'content_filter' }], usage: {} });
+    assertEq(filterCase.stop_reason, 'refusal', 'finish_reason content_filter -> refusal');
+    assertEq(D.Api._fromOpenAI({ error: { message: 'boom' } }), null, '오류 응답은 null(원본 유지) 반환');
+    assertEq(D.Api._fromOpenAI(null), null, 'null 안전');
+  });
+
+  scenario('36. effort 미지원 모델은 output_config 제외', async function () {
+    // 실 API 회귀(2026-09-01): claude-haiku-4-5는 effort를 지원하지 않아
+    // output_config를 보내면 400 "This model does not support the effort
+    // parameter"가 난다. 미지원 모델에서는 필드 자체가 빠져야 한다.
+    var D = DX();
+    var captured = null;
+    var orig = D.Api.request;
+    function mkItem(id, text) { return { msgId: id, kind: 'message', text: text, hash: 'h-' + id, placeholders: [], matches: [] }; }
+    resetState({ model: 'claude-haiku-4-5' });
+    D.Api.request = function (body) { captured = body; return orig.call(D.Api, body); };
+    try { await D.Api.translateBatch([mkItem('effA', 'effort guard test one')]); }
+    finally { D.Api.request = orig; }
+    assertTrue(!!captured, '요청이 만들어져야 함');
+    assertTrue(!('output_config' in captured), 'haiku 요청에는 output_config가 없어야 함');
+    assertEq(captured.model, 'claude-haiku-4-5', '모델 반영');
+
+    resetState({ model: 'claude-opus-5' });
+    captured = null;
+    D.Api.request = function (body) { captured = body; return orig.call(D.Api, body); };
+    try { await D.Api.translateBatch([mkItem('effB', 'effort guard test two')]); }
+    finally { D.Api.request = orig; }
+    assertTrue(!!captured && !!captured.output_config && captured.output_config.effort === 'low', '지원 모델에는 effort가 포함되어야 함');
   });
 
   // ---- runner ----------------------------------------------------------
