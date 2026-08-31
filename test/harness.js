@@ -85,7 +85,15 @@
   function DX() { return window.__DCXLT__; }
 
   function waitReady() {
-    return wait(function () { return DX() && DX().State.ready; }, 8000, 50);
+    // The userscript's own boot sequence (Detect.bootProbeWithRetry) needs
+    // up to C.PROBE_RETRY_MS.sum() == 300+1000+3000+8000 == 12300ms of
+    // nominal delay before State.ready becomes true, on a genuinely fresh
+    // page where the chat root starts empty (0 messages) — which is ALWAYS
+    // the case for this harness's initial load. An 8000ms budget here would
+    // give up before boot could ever finish, and every scenario/autorun
+    // capture downstream would silently record a false "boot failed" — this
+    // must stay comfortably above 12300ms.
+    return wait(function () { return DX() && DX().State.ready; }, 20000, 50);
   }
 
   function chatRootEl() {
@@ -152,8 +160,10 @@
   function Reporter() {
     this.results = [];
   }
-  Reporter.prototype.record = function (name, status, detail) {
-    this.results.push({ name: name, status: status, detail: detail || '' });
+  Reporter.prototype.record = function (id, name, status, ms, detail) {
+    var entry = { id: id, name: name, status: status, ms: ms };
+    if (detail) { entry.error = detail; entry.detail = detail; } // `detail` kept for renderReport()'s existing consumers
+    this.results.push(entry);
   };
 
   function assertEq(actual, expected, msg) {
@@ -161,8 +171,19 @@
   }
   function assertTrue(cond, msg) { if (!cond) throw new Error(msg || 'assertTrue failed'); }
 
-  var nextMsgId = 200000000000000001;
-  function freshId() { return String(nextMsgId++); }
+  // IMPORTANT: do not go back to a plain `var nextMsgId = 200000000000000001;
+  // nextMsgId++` counter. That literal exceeds Number.MAX_SAFE_INTEGER
+  // (2^53-1 ~= 9.007e15) by roughly 22x — at that magnitude consecutive
+  // representable IEEE-754 doubles are ~32 apart, so `++` mostly no-ops or
+  // jumps unpredictably instead of advancing by 1. freshId() would silently
+  // return the SAME id (or one of only a handful of distinct ids) across
+  // many calls, corrupting every scenario that creates more than one
+  // message (duplicate `id` attributes in the DOM make
+  // document.getElementById() only ever find the first one). Keep the
+  // counter itself a small, safe integer and build the id by string
+  // concatenation so no large-number arithmetic ever happens.
+  var msgIdCounter = 1;
+  function freshId() { return '30000000000' + String(msgIdCounter++).padStart(7, '0'); }
 
   // ---- 33 scenarios ----------------------------------------------------------
   var scenarios = [];
@@ -694,36 +715,84 @@
   });
 
   // ---- runner ----------------------------------------------------------
+  var RUNNING_UNDER_AUTORUN = /(?:^|[?&])autorun=1(?:&|$)/.test(location.search);
+
   async function runAll() {
+    // Synchronous marker, written before any await: lets a mid-run DOM
+    // capture distinguish "runAll() was never invoked" from "invoked but
+    // stalled inside it" (temporary diagnostic for headless/virtual-time
+    // capture — cheap enough to leave in permanently).
+    document.documentElement.setAttribute('data-dcxlt-run-started', String(Date.now()));
     var reporter = new Reporter();
+    var t0 = Date.now();
     var readyOk = await waitReady();
+    document.documentElement.setAttribute('data-dcxlt-wait-ready', readyOk ? 'true' : 'false');
     if (!readyOk) {
-      reporter.record('boot', 'FAIL', 'window.__DCXLT__.State.ready 가 되지 않음(부팅 실패)');
-      renderReport(reporter);
+      reporter.record(0, 'boot', 'FAIL', Date.now() - t0, 'window.__DCXLT__.State.ready 가 되지 않음(부팅 실패)');
+      finish(reporter);
       return reporter.results;
     }
     // ensure chat root exists & wired
     if (!chatRootEl()) {
-      reporter.record('boot', 'FAIL', '#dcxlt-test-chatroot 없음');
-      renderReport(reporter);
+      reporter.record(0, 'boot', 'FAIL', Date.now() - t0, '#dcxlt-test-chatroot 없음');
+      finish(reporter);
       return reporter.results;
     }
     for (var i = 0; i < scenarios.length; i++) {
       var s = scenarios[i];
+      var ts = Date.now();
+      document.documentElement.setAttribute('data-dcxlt-progress', (i + 1) + '/' + scenarios.length);
       try {
         await s.fn();
-        reporter.record(s.name, 'PASS', '');
+        reporter.record(i + 1, s.name, 'PASS', Date.now() - ts, '');
       } catch (e) {
-        reporter.record(s.name, 'FAIL', (e && e.message) || String(e));
+        reporter.record(i + 1, s.name, 'FAIL', Date.now() - ts, (e && e.message) || String(e));
         console.error('[harness]', s.name, e);
       }
     }
     // global mock-network assertion
+    var tXhr = Date.now();
     var xhrCount = window.__DCXLT_XHR_COUNT__();
-    reporter.record('mock 모드 네트워크 0건 어서션', xhrCount === 0 ? 'PASS' : 'FAIL', 'GM_xmlhttpRequest 호출 수: ' + xhrCount);
+    reporter.record(scenarios.length + 1, 'mock 모드 네트워크 0건 어서션', xhrCount === 0 ? 'PASS' : 'FAIL', Date.now() - tXhr, xhrCount === 0 ? '' : 'GM_xmlhttpRequest 호출 수: ' + xhrCount);
 
-    renderReport(reporter);
+    finish(reporter, xhrCount);
     return reporter.results;
+  }
+
+  // Writes results only once the whole run is truly done — the
+  // <pre id="dcxlt-results" data-done="1"> node is created here, not
+  // pre-existing in the HTML, specifically so a headless
+  // `--dump-dom`/`--virtual-time-budget` capture can distinguish "run still
+  // in progress" (node absent) from "run finished" (node present with full
+  // JSON), rather than racing a partially-rendered results table.
+  function finish(reporter, xhrCountArg) {
+    renderReport(reporter);
+    var xhrCount = typeof xhrCountArg === 'number' ? xhrCountArg : window.__DCXLT_XHR_COUNT__();
+    var summary = {
+      pass: reporter.results.filter(function (r) { return r.status === 'PASS'; }).length,
+      fail: reporter.results.filter(function (r) { return r.status === 'FAIL'; }).length,
+      skipped: reporter.results.filter(function (r) { return r.status === 'SKIPPED'; }).length,
+      xhrCount: xhrCount
+    };
+    var payload = {
+      scenarios: reporter.results.map(function (r) {
+        var o = { id: r.id, name: r.name, status: r.status, ms: r.ms };
+        if (r.error) o.error = r.error;
+        return o;
+      }),
+      summary: summary
+    };
+    window.__DCXLT_RESULTS__ = payload;
+    var pre = document.getElementById('dcxlt-results');
+    if (!pre) {
+      pre = document.createElement('pre');
+      pre.id = 'dcxlt-results';
+      pre.style.display = 'none';
+      document.body.appendChild(pre);
+    }
+    pre.textContent = JSON.stringify(payload, null, 1);
+    pre.setAttribute('data-done', '1');
+    console.log('DCXLT_SUMMARY pass=' + summary.pass + ' fail=' + summary.fail + ' skipped=' + summary.skipped + ' xhr=' + summary.xhrCount);
   }
 
   function renderReport(reporter) {

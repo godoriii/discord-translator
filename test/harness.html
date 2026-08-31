@@ -46,6 +46,13 @@
 <!-- 3) build the initial fake-Discord DOM skeleton the userscript will probe on boot -->
 <script>
   (function () {
+    // Capture the ORIGINAL query string (e.g. ?autorun=1) before it gets
+    // wiped out by the replaceState below — replaceState replaces the whole
+    // URL (path+search+hash), so anything reading location.search AFTER
+    // this point (the autorun trigger at the bottom of this file) would
+    // otherwise silently see an empty string and never fire.
+    window.__DCXLT_ORIGINAL_SEARCH__ = location.search;
+
     // Give the harness page a real Discord-shaped URL (/channels/<guild>/<channel>)
     // from the start, via replaceState (no navigation/reload). Real Discord's
     // location.pathname always has this shape, so Router.currentChannel() at
@@ -77,11 +84,22 @@
 </script>
 <!-- 4) the userscript itself -->
 <script src="/discord-inline-translate.user.js"></script>
-<!-- 5) wire the run button -->
+<!-- 5) wire the run button, and autorun for headless/CI capture -->
 <script>
   document.getElementById('run-all-btn').addEventListener('click', function () {
     window.__DCXLT_TEST__.runAll();
   });
+  // ?autorun=1 -> run the full suite without any interaction. Used for
+  // `--headless=new --virtual-time-budget=... --dump-dom` capture, where
+  // there's no one to click the button and no real wall clock to wait on.
+  // runAll() itself awaits window boot readiness before starting, and only
+  // writes <pre id="dcxlt-results" data-done="1"> once the entire run (all
+  // 33 scenarios + the network assertion) has actually finished — see
+  // finish() in harness.js — so a dump captured mid-run simply won't have
+  // that node yet rather than showing partial/misleading results.
+  if (/(?:^|[?&])autorun=1(?:&|$)/.test(window.__DCXLT_ORIGINAL_SEARCH__ || location.search)) {
+    window.__DCXLT_TEST__.runAll();
+  }
 </script>
 </body>
 </html>

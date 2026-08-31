@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Inline Translator (KO)
 // @namespace    https://github.com/godoriii/discord-translator
-// @version      0.1.0
+// @version      0.1.1
 // @description  디스코드 웹 채팅을 사용자 용어집 기반으로 한국어 인라인 번역
 // @match        https://discord.com/*
 // @match        https://ptb.discord.com/*
@@ -1687,8 +1687,32 @@
         Render.upsert(node, msgId, 'loading', { hash: item.hash });
         Queue.enqueue(item, 2);
       });
+    },
+    // Re-checks which mounted messages are actually on-screen right now and
+    // (re)starts their dwell timer. Used on tab-resume (visibilitychange ->
+    // visible, window focus): IntersectionObserver entries can be missed or
+    // stale after a period in a hidden/backgrounded tab (browsers may defer
+    // or coalesce IO callbacks the same way they throttle timers), so this
+    // does a direct geometric visibility check against the scroller's
+    // viewport rather than trusting only the observer's last-known state.
+    reevaluate: function () {
+      var scroller = State.detect.scroller;
+      var mounted = Detect.listMounted();
+      mounted.contentNodes.forEach(function (node) {
+        if (isNodeVisibleInScroller(node, scroller)) Viewport.onEnter(node);
+      });
     }
   };
+
+  function isNodeVisibleInScroller(node, scroller) {
+    var rect;
+    try { rect = node.getBoundingClientRect(); } catch (e) { return false; }
+    if (!rect || (rect.width === 0 && rect.height === 0)) return false;
+    var bounds = scroller
+      ? scroller.getBoundingClientRect()
+      : { top: 0, left: 0, bottom: (window.innerHeight || document.documentElement.clientHeight), right: (window.innerWidth || document.documentElement.clientWidth) };
+    return rect.bottom > bounds.top && rect.top < bounds.bottom && rect.right > bounds.left && rect.left < bounds.right;
+  }
 
   // ===== 12. Router =====
   var Router = {
@@ -2103,7 +2127,24 @@
         setInterval(reconcile, C.RECONCILE_IDLE_MS);
         reconcile();
         setInterval(Queue.tick, 100);
-        document.addEventListener('visibilitychange', function () { if (document.hidden) TCache.flush(true); });
+        // Tab-resume catch-up: when the user comes back from another tab (or
+        // this window regains OS focus), timers that were throttled while
+        // hidden (setInterval(reconcile,...), setInterval(Queue.tick,...),
+        // Viewport dwell) may be badly behind. Force an immediate catch-up
+        // pass rather than waiting for those timers to notice on their own.
+        // Throttled (leading+trailing) so visibilitychange and focus firing
+        // together only run this once, with a trailing call absorbed rather
+        // than dropped.
+        var onTabResume = Util.throttle(function () {
+          reconcile();
+          Queue.tick();
+          Viewport.reevaluate();
+        }, 500);
+        document.addEventListener('visibilitychange', function () {
+          if (document.hidden) TCache.flush(true);
+          else onTabResume();
+        });
+        window.addEventListener('focus', onTabResume);
         window.addEventListener('beforeunload', function () { TCache.flush(true); });
         State.ready = true;
         if (cfg.debug) {
@@ -2127,9 +2168,26 @@
     }
   };
 
+  function runBoot() {
+    // Boot.init()'s promise chain previously had no top-level rejection
+    // handler: any exception anywhere in it (Glossary.init, probe retries,
+    // UI construction, ...) became a silent unhandled promise rejection —
+    // State.ready would just never become true, with no visible signal
+    // anywhere in the DOM or a debuggable place. Surface it instead.
+    Boot.init().catch(function (err) {
+      Util.log('error', 'Boot.init failed', err);
+      try {
+        var el = document.getElementById('dcxlt-boot-error') || document.createElement('div');
+        el.id = 'dcxlt-boot-error';
+        el.hidden = true;
+        el.setAttribute('data-error', (err && (err.stack || err.message)) || String(err));
+        if (!el.parentNode) document.body.appendChild(el);
+      } catch (e2) { /* nothing more we can do */ }
+    });
+  }
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function () { Boot.init(); });
+    document.addEventListener('DOMContentLoaded', runBoot);
   } else {
-    Boot.init();
+    runBoot();
   }
 })();

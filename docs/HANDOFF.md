@@ -1,6 +1,6 @@
 # HANDOFF — 다른 기기에서 이어서 작업하기
 
-> 최종 갱신: 2026-08-31 18:40 (회사 Mac 세션). 이 파일은 세션 종료 시 다시 갱신됨.
+> 최종 갱신: 2026-08-31 23:15 (회사 Mac 세션). 이 파일은 세션 종료 시 다시 갱신됨.
 
 ## 이 프로젝트가 무엇인가
 Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 메시지를 Claude API로 한국어 인라인 번역하고, 사용자 용어집(`glossary.json`, WoW 공식 한국어 명칭)을 강제 적용한다. Windows/Mac 동일 스크립트 한 벌, GitHub raw URL로 자동 업데이트.
@@ -13,10 +13,12 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
 
 ## 현재 상태
 - [x] 설계 확정, DOM 실측, 용어집 45항목
-- [ ] 구현 (`discord-inline-translate.user.js` ~2,100줄 작성됨, 하네스 33 시나리오 검증 진행 중)
-- [ ] 실제 디스코드 탭 mock 주입 스모크 테스트
+- [x] 구현 (`discord-inline-translate.user.js` 2,193줄, v0.1.1)
+- [x] 실제 디스코드 탭 mock 주입 스모크 테스트 — 전 항목 PASS (탐지 13/13, 렌더 위치, 플레이스홀더, edited 제외, 네트워크 0)
+- [ ] 하네스 34 시나리오 헤드리스 최종 검증 (백그라운드 탭에선 스로틀링으로 28/34; headless CDP 재실행 중)
 - [ ] API 키 넣고 실제 번역 확인 (키는 Tampermonkey 설정 패널에 사용자가 직접 입력)
-- [ ] README 완성, GitHub 푸시, 양쪽 PC 설치
+- [x] README(한국어) 완성, GitHub 푸시
+- [ ] 양쪽 PC 설치 + API 키 입력 + 실제 번역 1회 확인
 
 ## 집에서 시작하는 법
 1. Chrome에 Tampermonkey 설치 → 리포의 raw URL(`https://raw.githubusercontent.com/godoriii/discord-translator/main/discord-inline-translate.user.js`)을 주소창에 열면 설치 창이 뜸.
@@ -34,3 +36,4 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
 - 19:10 구현 워커 1차 완료: 유저스크립트 2,135줄, 하네스 34 시나리오 중 28 PASS(나머지는 백그라운드 탭 타이머 스로틀링 영향으로 판단) → 헤드리스 가상시간 재검증 지시
 - 19:20 README 한국어 재작성 완료
 - 19:00~19:55 사이 Mac이 절전에 들어가 스모크 테스트 에이전트 중단 → caffeinate 재가동 후 재시도 중
+- 23:15 v0.1.1 푸시(실디스코드 스모크 PASS 버전). 하네스 헤드리스 검증은 진행 중 — 결과 나오면 이 파일 갱신
