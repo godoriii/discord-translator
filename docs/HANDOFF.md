@@ -1,6 +1,6 @@
 # HANDOFF — 다른 기기에서 이어서 작업하기
 
-> 최종 갱신: 2026-09-01 (집 컴퓨터 세션). 하네스 34/34 클린 통과 달성, v0.1.2.
+> 최종 갱신: 2026-09-01 오전 (집 컴퓨터 세션). v0.2.0 + max_tokens 이분할 시나리오 37·38 추가, 하네스 39/39 클린 통과.
 
 ## 이 프로젝트가 무엇인가
 Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 메시지를 Claude API로 한국어 인라인 번역하고, 사용자 용어집(`glossary.json`, WoW 공식 한국어 명칭)을 강제 적용한다. Windows/Mac 동일 스크립트 한 벌, GitHub raw URL로 자동 업데이트.
@@ -13,9 +13,9 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
 
 ## 현재 상태
 - [x] 설계 확정, DOM 실측, 용어집 45항목
-- [x] 구현 (`discord-inline-translate.user.js`, v0.1.2)
+- [x] 구현 (`discord-inline-translate.user.js`, v0.2.0)
 - [x] 실제 디스코드 탭 mock 주입 스모크 테스트 — 전 항목 PASS (v0.1.1 기준; v0.1.2 변경은 큐 실패경로/mock 한정이라 영향 없음, 그래도 설치 후 1회 재확인 권장)
-- [x] **하네스 34 시나리오 헤드리스 최종 검증 — 34/34 PASS, 네트워크 0건** (2026-09-01, 아래 "검증 방법" 참조)
+- [x] **하네스 38 시나리오 헤드리스 최종 검증 — 39/39 PASS(네트워크 어서션 포함), 네트워크 0건** (2026-09-01, 아래 "검증 방법" 참조)
 - [x] README(한국어) 완성, GitHub 푸시
 - [ ] API 키 넣고 실제 번역 확인 (키는 Tampermonkey 설정 패널에 사용자가 직접 입력)
 - [ ] 양쪽 PC 설치 + API 키 입력 + 실제 번역 1회 확인
@@ -42,14 +42,14 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
     --enable-logging=stderr --v=0 \
     "http://127.0.0.1:8899/test/harness.html?autorun=1" 2>&1 | grep DCXLT_SUMMARY
   ```
-  `DCXLT_SUMMARY pass=37 fail=0 skipped=0 xhr=0` 이 나와야 한다 (v0.2.0부터 37 = 시나리오 36 + 네트워크 어서션). (완주 후 크롬은 직접 kill)
+  `DCXLT_SUMMARY pass=39 fail=0 skipped=0 xhr=0` 이 나와야 한다 (38 시나리오 + 네트워크 어서션 = 39). (완주 후 크롬은 직접 kill)
   - 참고: `--virtual-time-budget`은 영구 setInterval과 상극이라 여전히 금지. 위처럼 실시간 타이머 + 스로틀링 비활성 플래그로 돌린다.
   - 하네스 디버그 파라미터: `&only=3,17,28`(부분 실행), `&spy=1`(큐 이벤트 `DCXLT_TRACE` 콘솔 트레이스), 완주 시 `DCXLT_RESULTS <json>` 콘솔 라인으로 시나리오별 결과 수집 가능.
 - 포그라운드 브라우저에서 보고 싶으면: `http://127.0.0.1:8899/test/harness.html` 을 **화면에 보이는 탭**으로 열고 `await __DCXLT_TEST__.runAll()`. (hidden 탭은 타이머 스로틀링 때문에 타이밍 시나리오가 가짜로 실패한다 — 이전 세션의 "백그라운드 28/34"가 그것)
 - 실제 페이지 스모크: DevTools 콘솔에서 `test/inject-shim.js` 내용 실행 → 이어서 유저스크립트 본문 실행 → `window.__DCXLT__` 로 탐지 수 확인
 
 ## 남은 개선 아이디어 (선택)
-- max_tokens 다항목 배치를 태우는 mock 모드 + 시나리오 추가 (현재 스위트는 이 경로를 다항목으로 커버하지 않음 — Opus 분석 지적)
+- ~~max_tokens 다항목 배치를 태우는 mock 모드 + 시나리오 추가 (현재 스위트는 이 경로를 다항목으로 커버하지 않음 — Opus 분석 지적)~~ → 완료(시나리오 37·38, mock 모드 maxtokens/maxtokens_always)
 - `_bisect` 직접 전송은 이분할 순간에 동시성 한도를 일시 초과할 수 있음(최대 BATCH_MAX_ITEMS=8, 유계). 문제되면 큐 기반 + 재병합 차단(maxBatch 태그) 방식으로 교체 검토.
 
 ## v0.2.0 — 커스텀 프로바이더 (2026-09-01)
@@ -62,3 +62,4 @@ Anthropic 외에 **OpenAI 호환 chat/completions API 전부**(Gemini/OpenRouter
 - 08-31 23:15 v0.1.1 푸시(실디스코드 스모크 PASS 버전)
 - 08-31 23:25 회사 머신에서 인계
 - 09-01 00:00~01:30 집 세션: 프리즈 재현 → 워치독으로 무한 루프 실측 특정(시나리오 18 방아쇠) → Codex/Opus 교차 검증 → 위 6건 수정 → **헤드리스 34/34 PASS 2회 연속** → v0.1.2
+- 09-01 (오전) max_tokens 다항목 배치 mock 모드 2종 + 시나리오 37·38 추가, 헤드리스 39/39

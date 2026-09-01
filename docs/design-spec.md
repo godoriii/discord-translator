@@ -173,7 +173,9 @@ const DEFAULTS = {
 
   fontScale: 0.875,              // em
   debug: false,
-  mockApi: 'off',                // 하네스 전용: off|ok|slow|ratelimit|error500|badjson|partial|scramble|authfail
+  mockApi: 'off',                // 하네스 전용: off|ok|slow|ratelimit|error500|badjson|partial|scramble|authfail|maxtokens|maxtokens_always
+                                  // maxtokens: 다항목 배치만 max_tokens(단건은 성공) — 이분할 사다리가 전원 완료로 수렴
+                                  // maxtokens_always: 모든 크기가 max_tokens(수동 재시도 제외) — 이분할이 전원 실패로 수렴, 호출 수는 유계(2N-1)
 };
 ```
 
@@ -1005,6 +1007,8 @@ FUNCTION parseResponse(json):
 | 31 | 임베드 번역 on/off | on이면 embed 항목이 `k:"embed"`로 배치에 포함, off면 미포함 |
 | 32 | 프롬프트 인젝션 문자열 포함 메시지 | 번역 블록이 textContent로 삽입되어 HTML 실행 없음 |
 | 33 | Tier 전환 | 용어집 50개 → `tier()==='inline'`, 인위적 3000개(8000토큰 초과) → `'matched'` + pin 항목만 system에 인라인 |
+| 37 | max_tokens 다항목 배치 (mockApi=maxtokens) | 8→4→2→1 이분할 사다리, 전원 done, 호출 수 15(=2N-1) |
+| 38 | max_tokens 단건까지 잘림 (mockApi=maxtokens_always) | 5→3+2→… 이분할, 전원 FAILED(max_tokens), 호출 수 9(=2N-1), 수동 재시도 성공 |
 
 ---
 

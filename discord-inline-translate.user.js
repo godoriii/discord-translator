@@ -1510,6 +1510,15 @@
           json: { stop_reason: stopReason || 'end_turn', content: [{ type: 'text', text: JSON.stringify({ translations: translations }) }], usage: usage(MockApi._cacheWarmed ? { cache_read_input_tokens: 180 } : { cache_creation_input_tokens: 200 }) }
         };
       }
+      function maxTokensResponse() {
+        // Deliberately truncated JSON, like the real API: onResponse checks
+        // stop_reason before parsing, so this body never needs to parse.
+        return {
+          status: 200,
+          headers: '',
+          json: { stop_reason: 'max_tokens', content: [{ type: 'text', text: '{"translations":[{"i":0,"ko":"잘려' }], usage: usage({ cache_read_input_tokens: 180 }) }
+        };
+      }
       MockApi._cacheWarmed = true;
 
       if (mode === 'authfail') {
@@ -1529,6 +1538,18 @@
       if (mode === 'badjson') {
         if (manualRetry) return okResponse();
         return { status: 200, headers: '', json: { stop_reason: 'end_turn', content: [{ type: 'text', text: '{not valid json' }], usage: usage() } };
+      }
+      if (mode === 'maxtokens') {
+        // Big batch overflows the output budget, singles fit: the bisect
+        // ladder must resolve every item to done.
+        if (batchLen > 1 && !manualRetry) return maxTokensResponse();
+        return okResponse();
+      }
+      if (mode === 'maxtokens_always') {
+        // Every batch size overflows, even singles: the bisect ladder
+        // bottoms out with every item FAILED (reason max_tokens).
+        if (manualRetry) return okResponse();
+        return maxTokensResponse();
       }
       if (mode === 'partial' || mode === 'scramble') return okResponse();
       if (mode === 'slow') return okResponse();

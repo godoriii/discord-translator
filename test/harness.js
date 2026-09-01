@@ -204,7 +204,7 @@
   var msgIdCounter = 1;
   function freshId() { return '30000000000' + String(msgIdCounter++).padStart(7, '0'); }
 
-  // ---- 36 scenarios ----------------------------------------------------------
+  // ---- 38 scenarios ----------------------------------------------------------
   var scenarios = [];
 
   function scenario(name, fn) { scenarios.push({ name: name, fn: fn }); }
@@ -801,6 +801,95 @@
     try { await D.Api.translateBatch([mkItem('effB', 'effort guard test two')]); }
     finally { D.Api.request = orig; }
     assertTrue(!!captured && !!captured.output_config && captured.output_config.effort === 'low', '지원 모델에는 effort가 포함되어야 함');
+  });
+
+  scenario('37. max_tokens 다항목 배치 → 이분할 사다리(8→4→2→1) 전원 완료', async function () {
+    resetState({ mockApi: 'maxtokens' });
+    var D = DX();
+    var sizes = [];
+    var origHandle = D.MockApi.handle;
+    D.MockApi.handle = function () {
+      var res = origHandle.apply(D.MockApi, arguments);
+      sizes.push(D.MockApi._lastItems.length);
+      return res;
+    };
+    var reqsBefore = D.State.stats.reqs;
+    var ids = [];
+    var ok;
+    try {
+      for (var i = 0; i < 8; i++) {
+        var id = freshId();
+        ids.push(id);
+        addMessage({ msgId: id, text: 'maxtokens ladder test ' + i });
+      }
+      forceReconcile();
+      ok = await wait(function () { return ids.every(function (mid) { var b = blockEl(mid); return b && b.dataset.state === 'done'; }); }, 10000);
+    } finally {
+      D.MockApi.handle = origHandle;
+    }
+    assertTrue(ok, '8개 전부 이분할 사다리(8→4→2→1)를 거쳐 done이 되어야 함');
+    assertEq(D.State.queue.failed.size, 0, 'FAILED 없이 전원 성공해야 함');
+    ids.forEach(function (id) {
+      var txt = blockEl(id).querySelector('.dcxlt-text').textContent;
+      assertTrue(!!txt && txt.length > 0, id + ' 번역 텍스트가 비어있지 않아야 함');
+    });
+    assertEq(D.State.stats.reqs - reqsBefore, 15, '요청 수는 이분할 트리 노드 수(2N-1=15)와 같아야 함(관측: ' + (D.State.stats.reqs - reqsBefore) + ')');
+    var sortedSizes = sizes.slice().sort(function (a, b) { return b - a; });
+    assertEq(JSON.stringify(sortedSizes), JSON.stringify([8, 4, 4, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1]), '배치 크기 시퀀스가 8→4→2→1 사다리와 일치해야 함(관측: ' + JSON.stringify(sortedSizes) + ')');
+    assertEq(D.State.queue.inflightCount, 0, 'in-flight가 남아있으면 안 됨');
+    assertEq(D.State.queue.queued.length, 0, '큐에 남은 항목이 없어야 함');
+    assertEq(D.State.queue.retryTimers.size, 0, '좀비 재시도 타이머가 없어야 함');
+
+    await sleep(600);
+    assertEq(D.State.stats.reqs, reqsBefore + 15, '완료 후 재큐/재발송 루프가 없어 요청 수가 그대로여야 함');
+  });
+
+  scenario('38. max_tokens 단건까지 잘림 → 전원 실패(유계 호출), 수동 재시도 성공', async function () {
+    resetState({ mockApi: 'maxtokens_always' });
+    var D = DX();
+    var sizes = [];
+    var origHandle = D.MockApi.handle;
+    D.MockApi.handle = function () {
+      var res = origHandle.apply(D.MockApi, arguments);
+      sizes.push(D.MockApi._lastItems.length);
+      return res;
+    };
+    var reqsBefore = D.State.stats.reqs;
+    var ids = [];
+    var ok;
+    try {
+      for (var i = 0; i < 5; i++) {
+        var id = freshId();
+        ids.push(id);
+        addMessage({ msgId: id, text: 'maxtokens always test ' + i });
+      }
+      forceReconcile();
+      ok = await wait(function () { return ids.every(function (mid) { return D.State.queue.failed.has(mid); }); }, 10000);
+    } finally {
+      D.MockApi.handle = origHandle;
+    }
+    assertTrue(ok, '5개 전부 이분할을 거쳐 FAILED 상태가 되어야 함');
+    ids.forEach(function (id) {
+      assertEq(blockEl(id).dataset.state, 'error', id + ' 블록이 error여야 함');
+      assertEq(D.State.queue.failed.get(id).reason, 'max_tokens', id + ' 실패 사유가 max_tokens여야 함');
+    });
+    assertEq(D.State.stats.reqs - reqsBefore, 9, '요청 수는 이분할 트리 노드 수(2N-1=9)와 같아야 함(관측: ' + (D.State.stats.reqs - reqsBefore) + ')');
+    var sortedSizes = sizes.slice().sort(function (a, b) { return b - a; });
+    assertEq(JSON.stringify(sortedSizes), JSON.stringify([5, 3, 2, 2, 1, 1, 1, 1, 1]), '배치 크기 시퀀스가 5→3+2→… 사다리와 일치해야 함(관측: ' + JSON.stringify(sortedSizes) + ')');
+    assertEq(D.State.queue.inflightCount, 0, 'in-flight가 남아있으면 안 됨');
+    assertEq(D.State.queue.queued.length, 0, '큐에 남은 항목이 없어야 함');
+    assertEq(D.State.queue.retryTimers.size, 0, '좀비 재시도 타이머가 없어야 함');
+
+    await sleep(600);
+    assertEq(D.State.stats.reqs, reqsBefore + 9, 'FAILED 항목이 자동 재큐되지 않아 요청 수가 그대로여야 함');
+
+    D.Queue.retry(ids[0]);
+    var ok2 = await wait(function () { var b = blockEl(ids[0]); return b && b.dataset.state === 'done'; }, 5000);
+    assertTrue(ok2, '수동 재시도 후 첫 항목이 done이 되어야 함');
+    assertEq(D.State.queue.failed.has(ids[0]), false, '수동 재시도 성공 후 failed에서 제거되어야 함');
+    for (var j = 1; j < ids.length; j++) {
+      assertEq(blockEl(ids[j]).dataset.state, 'error', ids[j] + '은 재시도하지 않았으므로 계속 error로 남아있어야 함');
+    }
   });
 
   // ---- runner ----------------------------------------------------------
