@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Inline Translator (KO)
 // @namespace    https://github.com/godoriii/discord-translator
-// @version      0.3.0
+// @version      0.3.1
 // @description  디스코드 웹 채팅을 사용자 용어집 기반으로 한국어 인라인 번역
 // @match        https://discord.com/*
 // @match        https://ptb.discord.com/*
@@ -31,7 +31,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '0.3.0';
+  var SCRIPT_VERSION = '0.3.1';
 
   // ===== 1. CONSTANTS =====
   var C = {
@@ -479,6 +479,44 @@
       var n = Number(base);
       if (!isFinite(n) || n <= 0) return 0;
       return Math.floor(n / 4194304) + 1420070400000;
+    },
+
+    // Queue._commit(신규 번역)과 recordFromCache(TCache 히트 백필) 양쪽이
+    // 공유하는 HistoryEntry 빌더. `entry`는 TCache 항목 형태(ko/mt/gv/
+    // hasSpoiler/kind/ts)를 기대한다 — Queue._commit이 방금 만든 entry든,
+    // TCache에서 꺼낸 hit든 동일한 형태라 그대로 재사용된다.
+    fromItem: function (item, ch, entry) {
+      var ph = History._packPh(item.placeholders);
+      return {
+        id: item.msgId,
+        ch: ch,
+        cn: Detect.channelName(ch),
+        g: Detect.guildId(),
+        au: item.author || '',
+        src: History.flatten(item.text, ph).slice(0, C.HISTORY_SRC_MAX),
+        ko: entry.ko,              // {{n}} 마커 유지 — 폴백 렌더가 rehydrate 한다
+        ph: ph,
+        gt: entry.mt,              // 용어집 매칭 목록 (TCache의 mt)
+        gv: entry.gv,
+        hs: !!entry.hasSpoiler,
+        k: entry.kind,
+        mt: History.timeOf(item.msgId),   // 메시지 시각 (스노플레이크)
+        tt: entry.ts,                     // 번역 시각
+        m: cfg.model,
+        h: item.hash
+      };
+    },
+    // v0.3.0 이전에 번역됐거나 TCache 히트로만 렌더된 메시지는 Queue._commit을
+    // 거치지 않아 기록에 한 번도 안 들어간다("0 / 0건" 증상). reconcile/
+    // reconcileEmbeds/Viewport.translateVisibleNow의 TCache 히트 경로에서
+    // 호출해 기록을 소급 채운다. tt는 TCache 항목의 원래 번역 시각을 그대로
+    // 쓴다(없으면 지금 시각) — 목록 정렬이 "방금 백필됨"으로 왜곡되지 않도록.
+    recordFromCache: function (item, ch, hit) {
+      if (!hit || hit.skip) return false;
+      if (History.get(item.msgId, item.hash)) return false;
+      var entry = Object.assign({}, hit, { ts: hit.ts || Util.now() });
+      History.append(History.fromItem(item, ch, entry));
+      return true;
     },
 
     append: function (entry) {
@@ -1540,6 +1578,12 @@
       if (cfg.provider === 'openai') return !!cfg.customBaseUrl;
       return !!State.apiKey;
     },
+    // 브라우저 비밀번호 자동완성이 API 키 입력칸에 저장된 디스코드 비번 등을
+    // 채워 넣는 사고를 막기 위한 최소 형식 검사. Anthropic 키는 항상
+    // sk-ant- 로 시작한다 — 저장/연결 테스트 직전 게이트로 쓴다.
+    looksLikeAnthropicKey: function (k) {
+      return /^sk-ant-/.test(String(k || ''));
+    },
     // 설정 패널의 "연결 테스트" 버튼용. 실제 배치 프롬프트를 만들지 않고
     // 최소 요청 하나만 보내 키/엔드포인트가 살아있는지 확인한다.
     testConnection: function (overrides) {
@@ -2164,7 +2208,11 @@
         var sk = Extract.shouldSkip(item);
         if (sk.skip) return;
         var hit = TCache.get(TCache.key(msgId, item.hash));
-        if (hit) { Render.upsert(node, msgId, 'done', Object.assign({}, hit, { hash: item.hash })); return; }
+        if (hit) {
+          Render.upsert(node, msgId, 'done', Object.assign({}, hit, { hash: item.hash }));
+          History.recordFromCache(item, ch, hit);
+          return;
+        }
         if (historyRestore(node, msgId, item, ch)) return;
         item.channelId = ch;
         Render.upsert(node, msgId, 'loading', { hash: item.hash });
@@ -2286,8 +2334,24 @@
       if (!UI._root) UI._buildPanel();
       UI._root.hidden = false;
       UI._selectTab(tab || '일반');
+      // _buildPanel()이 이미 _fillFromCfg()로 키 칸을 비웠지만, 패널이
+      // 이미 만들어진 상태의 재오픈(가장 흔한 경로)은 _fillFromCfg를 다시
+      // 타지 않는다 — 그 사이 자동완성이 채워 넣었을 수 있으니 열 때마다
+      // 다시 비운다.
+      UI._clearKeyFields(UI._shadow);
     },
     closeSettings: function () { if (UI._root) UI._root.hidden = true; },
+    _clearKeyFields: function (shadow) {
+      if (!shadow) return;
+      var apiKeyEl = shadow.querySelector('[data-f="apiKey"]');
+      var customKeyEl = shadow.querySelector('[data-f="customApiKey"]');
+      if (apiKeyEl) apiKeyEl.value = '';
+      if (customKeyEl) customKeyEl.value = '';
+      setTimeout(function () {
+        if (apiKeyEl) apiKeyEl.value = '';
+        if (customKeyEl) customKeyEl.value = '';
+      }, 300);
+    },
     _buildPanel: function () {
       var host = document.createElement('div');
       host.id = 'dcxlt-settings-host';
@@ -2338,6 +2402,16 @@
       groq: { baseUrl: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
       ollama: { baseUrl: 'http://127.0.0.1:11434/v1', model: 'llama3.1' }
     },
+    // 브라우저 비밀번호 자동완성이 저장된 다른 계정 비밀번호(예: 디스코드
+    // 로그인 비번)를 이 칸에 채워넣는 사고(§13 Api.looksLikeAnthropicKey
+    // 참고)를 막는다: type=password는 Chrome이 저장된 자격증명을
+    // 적극적으로 채워 넣지만 type=text는 그러지 않는다. 대신
+    // -webkit-text-security로 시각적 마스킹을 유지하고, 매 패널 빌드마다
+    // 바뀌는 무작위 name으로 "이건 로그인 폼이 아니다" 신호를 더한다.
+    _noAutofillAttrs: function () {
+      return 'autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" ' +
+        'style="-webkit-text-security:disc" name="dcxlt-nokey-' + Math.random().toString(36).slice(2, 10) + '"';
+    },
     _panelHtml: function () {
       return '<div class="modal" style="position:relative">' +
         '<button class="close" data-act="close">✕</button>' +
@@ -2353,7 +2427,7 @@
         '<option value="openai">커스텀 — OpenAI 호환 (Gemini/OpenRouter/Groq/Ollama 등)</option>' +
         '</select>' +
         '<div data-el="anthropicFields">' +
-        '<label>Anthropic API 키</label><input type="password" data-f="apiKey">' +
+        '<label>Anthropic API 키</label><input type="text" data-f="apiKey" ' + UI._noAutofillAttrs() + '>' +
         '<div class="small" id="dcxlt-keyhint"></div>' +
         '<label>모델</label><select data-f="model">' +
         '<option value="claude-opus-5">claude-opus-5 (캐시 최소 512토큰)</option>' +
@@ -2371,7 +2445,7 @@
         '</div>' +
         '<label>Base URL (끝의 /chat/completions 는 자동으로 붙음)</label><input type="text" data-f="customBaseUrl" placeholder="https://generativelanguage.googleapis.com/v1beta/openai">' +
         '<label>모델명</label><input type="text" data-f="customModel" placeholder="gemini-3.7-flash">' +
-        '<label>API 키</label><input type="password" data-f="customApiKey">' +
+        '<label>API 키</label><input type="text" data-f="customApiKey" ' + UI._noAutofillAttrs() + '>' +
         '<div class="small" id="dcxlt-customkeyhint"></div>' +
         '<label>추가 헤더 (JSON, 선택)</label><textarea data-f="customHeaders" placeholder=\'{"HTTP-Referer": "https://example.com"}\'></textarea>' +
         '<div class="small">목록에 없는 도메인은 첫 요청 때 Tampermonkey가 접근 허용을 물어봅니다.</div>' +
@@ -2437,10 +2511,27 @@
         // since this panel isn't rebuilt/refilled on every open (see
         // openSettings). Reading the checkbox before this would re-persist
         // enabled:false in the patch below and undo the reenable.
+        // B: 자동완성이 채운 값(예: 디스코드 로그인 비번)을 그대로 저장하면
+        // 멀쩡히 동작하던 키가 401로 조용히 깨진다 — 형식이 안 맞으면
+        // 저장을 거부하고 칸을 비운다(§13 Api.looksLikeAnthropicKey).
         var key = shadow.querySelector('[data-f="apiKey"]').value;
-        if (key) Store.setApiKey(key);
+        if (key) {
+          if (cfg.provider !== 'openai' && !Api.looksLikeAnthropicKey(key)) {
+            Render.toast('Anthropic API 키는 sk-ant- 로 시작합니다 — 입력값을 저장하지 않았습니다 (브라우저 자동완성 값일 수 있음)');
+            shadow.querySelector('[data-f="apiKey"]').value = '';
+          } else {
+            Store.setApiKey(key);
+          }
+        }
         var customKey = shadow.querySelector('[data-f="customApiKey"]').value;
-        if (customKey) Store.setCustomApiKey(customKey);
+        if (customKey) {
+          if (/\s/.test(customKey)) {
+            Render.toast('커스텀 API 키에 공백이 포함되어 있습니다 — 저장하지 않았습니다');
+            shadow.querySelector('[data-f="customApiKey"]').value = '';
+          } else {
+            Store.setCustomApiKey(customKey);
+          }
+        }
         var newBaseUrl = shadow.querySelector('[data-f="customBaseUrl"]').value.trim();
         if (newBaseUrl) UI.reenableAfterAuth();
         var enabledEl = shadow.querySelector('[data-f="enabled"]');
@@ -2518,6 +2609,11 @@
       shadow.querySelector('[data-el="customFields"]').style.display = isCustom ? '' : 'none';
     },
     _fillFromCfg: function (shadow) {
+      // 자동완성이 렌더 직후(동기) 채워 넣는 경우와, 비동기로(다음 틱 이후)
+      // 채워 넣는 경우가 둘 다 관측된다 — 즉시 한 번, 300ms 뒤 한 번 더
+      // 비운다(_clearKeyFields). 저장된 키는 절대 되채우지 않는다(§13
+      // refreshKeyHints 주석).
+      UI._clearKeyFields(shadow);
       shadow.querySelector('[data-f="provider"]').value = cfg.provider || 'anthropic';
       shadow.querySelector('[data-f="customBaseUrl"]').value = cfg.customBaseUrl || '';
       shadow.querySelector('[data-f="customModel"]').value = cfg.customModel || '';
@@ -2586,6 +2682,13 @@
       if (resultEl) resultEl.textContent = '테스트 중…';
       var typedKey = (shadow.querySelector('[data-f="apiKey"]').value || '').trim();
       var typedCustomKey = (shadow.querySelector('[data-f="customApiKey"]').value || '').trim();
+      // B: 타이핑된 값이 자동완성 오염(디스코드 비번 등)일 가능성이 있으면
+      // 실제 요청을 보내기 전에 형식으로 거른다 — 401을 받고서야 알아채는
+      // 대신 즉시 알려준다.
+      if (typedKey && cfg.provider !== 'openai' && !Api.looksLikeAnthropicKey(typedKey)) {
+        if (resultEl) resultEl.textContent = '키 형식 오류 — sk-ant- 로 시작해야 합니다 (자동완성 값이 들어갔는지 확인)';
+        return;
+      }
       var overrides = {
         apiKey: typedKey || State.apiKey,
         customApiKey: typedCustomKey || State.customApiKey
@@ -3059,7 +3162,11 @@
         if (sk.skip) { Render.remove(item.msgId); return; }
         var key = TCache.key(item.msgId, item.hash);
         var hit = TCache.get(key);
-        if (hit) { Render.upsert(anchorEl, item.msgId, 'done', Object.assign({}, hit, { hash: item.hash })); return; }
+        if (hit) {
+          Render.upsert(anchorEl, item.msgId, 'done', Object.assign({}, hit, { hash: item.hash }));
+          History.recordFromCache(item, ch, hit);
+          return;
+        }
         if (Queue.has(item.msgId, item.hash)) return;
         if (historyRestore(anchorEl, item.msgId, item, ch)) return;
         Render.upsert(anchorEl, item.msgId, 'loading', { hash: item.hash });
@@ -3134,6 +3241,7 @@
       if (hit) {
         resolved.add(msgId);
         Render.upsert(node, msgId, 'done', Object.assign({}, hit, { hash: item.hash }));
+        History.recordFromCache(item, ch, hit);
         glossaryRecheck(item, ch, key, hit);
         return;
       }
@@ -3179,26 +3287,8 @@
 
     // 영구 기록. skip 항목은 남기지 않는다(번역 결과가 없음).
     if (!entry.skip) {
-      var ph = History._packPh(item.placeholders);
       var ch = item.channelId || Router.currentChannel() || '';
-      History.append({
-        id: item.msgId,
-        ch: ch,
-        cn: Detect.channelName(ch),
-        g: Detect.guildId(),
-        au: item.author || '',
-        src: History.flatten(item.text, ph).slice(0, C.HISTORY_SRC_MAX),
-        ko: entry.ko,              // {{n}} 마커 유지 — 폴백 렌더가 rehydrate 한다
-        ph: ph,
-        gt: entry.mt,              // 용어집 매칭 목록 (TCache의 mt)
-        gv: entry.gv,
-        hs: !!entry.hasSpoiler,
-        k: entry.kind,
-        mt: History.timeOf(item.msgId),   // 메시지 시각 (스노플레이크)
-        tt: entry.ts,                     // 번역 시각
-        m: cfg.model,
-        h: item.hash
-      });
+      History.append(History.fromItem(item, ch, entry));
     }
 
     var node = item.kind === 'embed'

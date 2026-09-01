@@ -1,6 +1,6 @@
 # HANDOFF — 다른 기기에서 이어서 작업하기
 
-> 최종 갱신: 2026-09-01 (집 컴퓨터 세션). v0.3.0 — "매번 새로고침해야 한다" 근본 원인 수정(`previousSeen` 영구 강등 버그), 영구 번역 기록(`History`)과 폴백 렌더, 플로팅 위젯, 번역 기록 오버레이 추가. 시나리오 43-46 추가, 하네스 47/47 클린 통과.
+> 최종 갱신: 2026-09-01 (집 컴퓨터 세션). v0.3.1 — 번역 기록 캐시 히트 백필(TCache 히트로 렌더된 메시지가 기록에 안 잡히던 "0 / 0건" 버그), 브라우저 자동완성 API 키 오염 방지. 시나리오 47-48 추가, 하네스 49/49 클린 통과.
 
 ## 이 프로젝트가 무엇인가
 Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 메시지를 Claude API로 한국어 인라인 번역하고, 사용자 용어집(`glossary.json`, WoW 공식 한국어 명칭)을 강제 적용한다. Windows/Mac 동일 스크립트 한 벌, GitHub raw URL로 자동 업데이트.
@@ -42,7 +42,7 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
     --enable-logging=stderr --v=0 \
     "http://127.0.0.1:8899/test/harness.html?autorun=1" 2>&1 | grep DCXLT_SUMMARY
   ```
-  `DCXLT_SUMMARY pass=47 fail=0 skipped=0 xhr=0` 이 나와야 한다 (46 시나리오 + 네트워크 어서션 = 47). (완주 후 크롬은 직접 kill)
+  `DCXLT_SUMMARY pass=49 fail=0 skipped=0 xhr=0` 이 나와야 한다 (48 시나리오 + 네트워크 어서션 = 49). (완주 후 크롬은 직접 kill)
   - 참고: `--virtual-time-budget`은 영구 setInterval과 상극이라 여전히 금지. 위처럼 실시간 타이머 + 스로틀링 비활성 플래그로 돌린다.
   - 하네스 디버그 파라미터: `&only=3,17,28`(부분 실행), `&spy=1`(큐 이벤트 `DCXLT_TRACE` 콘솔 트레이스), 완주 시 `DCXLT_RESULTS <json>` 콘솔 라인으로 시나리오별 결과 수집 가능.
 - 포그라운드 브라우저에서 보고 싶으면: `http://127.0.0.1:8899/test/harness.html` 을 **화면에 보이는 탭**으로 열고 `await __DCXLT_TEST__.runAll()`. (hidden 탭은 타이머 스로틀링 때문에 타이밍 시나리오가 가짜로 실패한다 — 이전 세션의 "백그라운드 28/34"가 그것)
@@ -113,6 +113,13 @@ TCache는 `msgId|hash|targetLang|model`로 키가 잡혀 있어 모델을 바꾸
 
 43(기록 적재·중복 교체·2000건 FIFO 상한), 44(캐시 비우기/모델 변경 후 기록 폴백 렌더로 즉시 복원, API 재호출 없음), 45(오버레이 열기/검색/채널 필터/내보내기/개별 삭제/2단계 전체 지우기, 캐시 비우기와 분리 확인), 46((A) 스크롤업 중 도착 → 하단 복귀 시 즉시 번역되는 Part1 회귀 확인, (B) 위젯 버튼으로 백필 제약 무시 즉시 번역, (C) 꺼짐 표시/재활성화, (D) `showWidget` 토글, (E) Alt+T 재활성화 즉시 reconcile). 하네스 46 시나리오, 47/47 PASS(네트워크 어서션 포함) 2회 연속.
 
+## v0.3.1 — 기록 캐시 백필 + 자동완성 API 키 오염 방지 (2026-09-01)
+
+실제 디스코드 탭에서 두 가지 문제를 발견해 같은 세션에서 고쳤다.
+
+1. **번역 기록 "0 / 0건"** — v0.3.0의 `History.append`는 `Queue._commit`(신규 번역이 API에서 도착한 순간)에서만 호출됐다. TCache 히트로 렌더된 메시지(v0.3.0 이전에 이미 번역된 메시지 포함)는 한 번도 `Queue._commit`을 거치지 않으므로 기록에 전혀 안 잡혔다 — 화면은 번역으로 가득한데 오버레이는 `0 / 0건`. **수정**: `Queue._commit`이 쓰던 엔트리 조립 로직을 `History.fromItem(item, ch, entry)`로 추출하고, `reconcile`/`reconcileEmbeds`/`Viewport.translateVisibleNow`의 TCache 히트 분기에서 `History.recordFromCache(item, ch, hit)`를 호출해 아직 기록에 없는 항목만 소급 적재한다(원래 번역 시각 `tt`는 TCache의 `ts`를 그대로 써 목록 정렬이 "방금 백필됨"으로 왜곡되지 않게 함, API 재호출 없음, 멱등). 시나리오 47.
+2. **브라우저 비밀번호 자동완성이 API 키 칸을 오염** — 설정 패널의 `<input type="password" data-f="apiKey">`가 Chrome 저장 비밀번호(디스코드 로그인 비번 등)의 자동완성 타깃이 됐다. 연결 테스트를 누르면 그 값이 `x-api-key`로 전송돼 `키 거부 (401)`가 뜨는데(정작 저장된 실 키로는 번역이 잘 됨), **더 나쁘게는** 저장 버튼을 누르면 `if (key) Store.setApiKey(key)`가 멀쩡히 동작하던 키를 그 값으로 덮어써 실사용 번역까지 401로 끊기는 함정이었다. `[data-f="customApiKey"]`도 동일 위험. **수정**: 두 입력을 `type="text"` + `-webkit-text-security:disc`(시각적 마스킹 유지, Chrome이 저장된 비밀번호를 넣지 않는 타입) + `autocomplete="off"`/무작위 `name`으로 바꾸고, 패널을 열 때마다(및 300ms 뒤 한 번 더, 비동기 자동완성 대비) 입력칸을 강제로 비운다. `Api.looksLikeAnthropicKey`(`sk-ant-` 접두사)로 저장 직전·연결 테스트 직전 형식을 검증해, 형식이 안 맞으면 저장을 거부하고 안내 토스트를 띄운 뒤 칸을 비운다(커스텀 키는 공백 포함 여부만 보는 약한 검사). 시나리오 48.
+
 ## 진행 로그
 - 08-31 18:40 GitHub 공개 리포 생성·초기 스냅샷 푸시 (사용자 승인)
 - 08-31 19:10 구현 워커 1차 완료: 하네스 34 중 28 PASS → 헤드리스 재검증 지시
@@ -124,3 +131,4 @@ TCache는 `msgId|hash|targetLang|model`로 키가 잡혀 있어 모델을 바꾸
 - 09-01 사용자: 양쪽 PC 설치 + API 키 입력 + 실번역 확인 완료 → 현재 상태 체크리스트 전부 완료
 - 09-01 (오후) 실사용 디버깅: 키 입력 전 로드된 탭 → 401 → enabled:false 영구화 확인 → 키 가드/자동 재활성화/연결 테스트/README 트러블슈팅 → 43/43 → v0.2.2
 - 09-01 (오후) "매번 새로고침해야 한다" 제보 → 계측 프로브로 `previousSeen` 영구 강등 버그 특정 → `seen`/`resolved` 분리 수정(pre-flight 43/43 회귀 없음 확인) → 영구 번역 기록(`History`)·폴백 렌더·플로팅 위젯·번역 기록 오버레이 구현 → 시나리오 43-46 추가 → 헤드리스 47/47 PASS 2회 연속 → v0.3.0
+- 09-01 (오후) 실디스코드 재확인 중 "번역 기록 0/0건"(TCache 히트 렌더가 History를 거치지 않음)과 자동완성 API 키 오염(설정 패널 `type=password`가 저장된 디스코드 비번을 채워 저장/연결 테스트를 401로 깨뜨림)을 함께 발견 → `History.fromItem`/`recordFromCache`로 캐시 히트 백필 + `Api.looksLikeAnthropicKey` 형식 검증·`type=text` 자동완성 차단 수정 → 시나리오 47-48 추가 → 헤드리스 49/49 PASS 2회 연속 → v0.3.1

@@ -439,6 +439,8 @@ History._packPh(placeholders) -> ph[]     // {t,l,r?} — raw(outerHTML) 400B �
 History._unpackPh(ph) -> placeholders[]
 History.flatten(text, ph) -> string       // {{n}} 마커 → label 치환한 평문(표시·검색·내보내기 전용)
 History.timeOf(msgId) -> number           // 스노플레이크 → ms (Number 나눗셈, BigInt 불필요)
+History.fromItem(item, ch, entry) -> Entry  // Queue._commit/recordFromCache 공유 엔트리 빌더 (v0.3.1)
+History.recordFromCache(item, ch, hit) -> boolean  // TCache 히트 렌더 시 소급 적재, 이미 있으면 no-op (v0.3.1)
 ```
 TCache 키(`msgId|hash|targetLang|model`)는 모델을 바꾸거나 LRU에서 밀리면 통째로 고아가 된다.
 History는 `id|hash`만으로 키가 잡혀 모델/언어와 무관하게 살아남는다. `Queue._commit`에서 커밋마다
@@ -446,7 +448,9 @@ History는 `id|hash`만으로 키가 잡혀 모델/언어와 무관하게 살아
 `historyRestore()` 폴백이 TCache 미스 시 여기서 번역을 되살려 현재 모델 키로 TCache를 다시 데운다.
 `ko`는 `{{n}}` 마커가 살아있는 원형 그대로, `ph`(압축 placeholders)와 `gv`/`gt`(용어집 rev·매칭
 목록, 원본 그대로)를 함께 저장해야 `Extract.rehydrate`가 매칭 안 되는 마커를 지우지 않고, 복원 후에도
-`glossaryRecheck`가 예전과 동일하게 재현된다.
+`glossaryRecheck`가 예전과 동일하게 재현된다. (v0.3.1) `Queue._commit`은 새 번역만 적재해 TCache
+히트로 렌더된(v0.3.0 이전에 이미 번역된 포함) 메시지는 기록에 빠졌다 — 세 히트 경로 모두에서
+`History.recordFromCache`를 호출해 소급 적재한다(§10 시나리오 47).
 
 ### 4.14 `Widget` (플로팅 위젯, v0.3.0, §13b)
 ```js
@@ -1085,6 +1089,8 @@ FUNCTION parseResponse(json):
 | 44 | 기록 폴백 렌더 (v0.3.0) | `TCache.clear()` 후에도 API 재호출 없이 기록에서 즉시 복원(멘션/링크 자리표시자 포함 원본과 동일 렌더), 모델 변경 후에도 새 모델 키로 TCache가 다시 데워짐 |
 | 45 | 번역 기록 오버레이 (v0.3.0) | 열기(메뉴/Alt+H/위젯 ☰), 대소문자 무시 검색, 채널 필터, `.txt`/`.json` 내보내기(스텁된 `_download`로 검증), 개별 삭제, 2단계 `기록 지우기`(`window.confirm` 미사용), 캐시 비우기와 분리(서로 지우지 않음), Esc로 닫힘 |
 | 46 | 스크롤업 중 도착한 메시지 + 위젯 즉시 번역 (v0.3.0) | (A) `previousSeen`/`resolved` 분리 회귀 검증: 스크롤업 중 마운트 → 하단 복귀 시 dwell/예산 없이 즉시 번역(priority 0). (B) 위젯 `▶ 번역`이 backfill 제약 무시하고 화면 메시지 번역. (C) 꺼짐 시 `⏸ 꺼짐` 표시, 클릭 재활성화. (D) `showWidget` 설정으로 위젯 표시/숨김. (E) Alt+T 재활성화가 1500ms 인터벌을 기다리지 않고 즉시 `reconcile()` |
+| 47 | 캐시 히트 재렌더 시 기록 백필 (v0.3.1) | 신규 번역 2건 커밋 → `History.clear()`(v0.3.0 이전 상태 시뮬레이션) → 블록 제거 후 재조정하면 TCache 히트 경로에서 `History.recordFromCache`가 API 재호출 없이 원래 번역 시각(`tt`)으로 소급 적재, 재조정해도 중복 적재 없음(멱등), 임베드 히트도 동일하게 `k:'embed'`/`au:''`로 백필 |
+| 48 | 브라우저 자동완성 값이 API 키로 저장/전송되지 않음 (v0.3.1) | API 키 입력은 `type="text"`+`-webkit-text-security:disc`로 자동완성 차단, 형식이 `sk-ant-`로 시작하지 않는 typed 값은 연결 테스트를 `Api.testConnection` 호출 없이 형식 오류로 거부하고 저장도 거부(`State.apiKey` 불변, 안내 토스트), 올바른 형식은 정상 저장, 패널 재오픈 시 300ms 뒤 입력칸 재클리어 |
 
 ---
 

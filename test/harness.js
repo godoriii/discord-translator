@@ -234,7 +234,7 @@
   var msgIdCounter = 1;
   function freshId() { return '30000000000' + String(msgIdCounter++).padStart(7, '0'); }
 
-  // ---- 42 scenarios ----------------------------------------------------------
+  // ---- 48 scenarios ----------------------------------------------------------
   var scenarios = [];
 
   function scenario(name, fn) { scenarios.push({ name: name, fn: fn }); }
@@ -1300,6 +1300,133 @@
     await sleep(80);
     assertTrue(D.State.queue.queued.length > 0 || D.State.queue.inflightCount > 0 || !!blockEl(e2),
       'Alt+T 재활성화는 1500ms 인터벌을 기다리지 않고 즉시 reconcile 해야 함');
+  });
+
+  scenario('47. 캐시 히트 재렌더 시 기록 백필 (v0.3.0 이전 번역도 기록에 나타남)', async function () {
+    resetState();
+    var D = DX();
+    var idA = freshId(), idB = freshId();
+    addMessage({ msgId: idA, text: 'cache backfill message A' });
+    addMessage({ msgId: idB, text: 'cache backfill message B' });
+    forceReconcile();
+    var ok = await wait(function () {
+      return [idA, idB].every(function (id) { var b = blockEl(id); return b && b.dataset.state === 'done'; });
+    }, 20000);
+    assertTrue(ok, '2건 모두 번역 완료되어야 함');
+    await wait(function () { return D.History.all().length === 2; }, 2000);
+    assertEq(D.History.all().length, 2, '최초 커밋 2건이 기록에 적재되어야 함');
+
+    var itemA = D.Extract.fromContentNode(contentEl(idA));
+    var hashA = itemA.hash;
+    var tsA = D.TCache.get(D.TCache.key(idA, hashA)).ts;
+    assertTrue(typeof tsA === 'number' && tsA > 0, 'TCache 항목에 번역 시각(ts)이 있어야 함');
+
+    // v0.3.0 이전 상태 시뮬레이션: TCache는 그대로 두고 기록만 비운다.
+    D.History.clear();
+    assertEq(D.History.all().length, 0, '기록을 비운 상태여야 함');
+
+    var reqsBefore = D.State.stats.reqs;
+
+    // 캐시 히트 경로를 타려면 done 블록을 먼저 제거해야 한다 — 블록이
+    // 남아있으면 reconcile의 "이미 done(해시 동일)" 가드에서 조기
+    // return돼 TCache를 건드리지 않는다.
+    D.Render.remove(idA);
+    D.Render.remove(idB);
+    assertTrue(!blockEl(idA) && !blockEl(idB), '두 블록 모두 제거된 상태여야 함');
+
+    forceReconcile();
+    var ok2 = await wait(function () { return D.History.all().length === 2; }, 2000);
+    assertTrue(ok2, '캐시 히트 렌더에서 기록이 백필되어야 함 (관측: ' + D.History.all().length + ')');
+    assertEq(D.State.stats.reqs, reqsBefore, '캐시 히트 백필에는 API 호출이 없어야 함');
+
+    var backfilled = D.History.get(idA, hashA);
+    assertTrue(!!backfilled, '메시지 A가 기록에 있어야 함');
+    assertEq(backfilled.tt, tsA, '기록의 tt는 TCache의 원래 번역 시각을 유지해야 함');
+    assertEq(backfilled.src, 'cache backfill message A', '원문 평문이 일치해야 함');
+
+    // 멱등성: 다시 reconcile 해도 중복 적재되지 않아야 함
+    forceReconcile();
+    await sleep(300);
+    assertEq(D.History.all().length, 2, '재조정해도 중복 적재되지 않아야 함');
+
+    // --- 임베드 경로 ---
+    if (window.Fixtures && typeof window.Fixtures.mkEmbed === 'function') {
+      var eid = freshId();
+      // 본문은 이미 한국어라 skip되게 해 임베드 커밋 1건만 늘어나게 한다
+      // (본문까지 영어면 chat kind 커밋이 별도로 하나 더 붙어 카운트가 어긋남).
+      addMessage({
+        msgId: eid, text: '이 메시지는 이미 한국어라 본문은 스킵되어야 합니다',
+        embedHtml: window.Fixtures.mkEmbed({ title: 'Notice', description: 'embed cache backfill body' })
+      });
+      forceReconcile();
+      var okE = await wait(function () { var b = D.Render.blockFor(eid + '-embed-0'); return b && b.dataset.state === 'done'; }, 8000);
+      assertTrue(okE, '임베드 번역이 완료되어야 함');
+      await wait(function () { return D.History.all().length === 3; }, 2000);
+      assertEq(D.History.all().length, 3, '임베드 커밋도 기록에 적재되어야 함');
+
+      D.History.clear();
+      assertEq(D.History.all().length, 0, '임베드 기록도 비워야 함');
+      D.Render.remove(eid + '-embed-0');
+      assertTrue(!D.Render.blockFor(eid + '-embed-0'), '임베드 블록이 제거된 상태여야 함');
+      forceReconcile();
+      var okE2 = await wait(function () { return D.History.all().length === 1; }, 2000);
+      assertTrue(okE2, '임베드 캐시 히트도 기록에 백필되어야 함');
+      var embedEntry = D.History.all()[0];
+      assertEq(embedEntry.k, 'embed', '임베드 항목의 k는 embed여야 함 (관측: ' + embedEntry.k + ')');
+      assertEq(embedEntry.au, '', '임베드는 author가 없어야 함 (관측: ' + JSON.stringify(embedEntry.au) + ')');
+    }
+  });
+
+  scenario('48. 브라우저 자동완성 값이 API 키로 저장/전송되지 않음', async function () {
+    resetState();
+    var D = DX();
+    D.UI.openSettings('일반');
+    var panelHost = document.getElementById('dcxlt-settings-host');
+    assertTrue(!!panelHost && !!panelHost.shadowRoot, '설정 패널 shadowRoot이 있어야 함');
+    var shadow = panelHost.shadowRoot;
+    var apiKeyInput = shadow.querySelector('[data-f="apiKey"]');
+    var customKeyInput = shadow.querySelector('[data-f="customApiKey"]');
+
+    // (A) 자동완성 방지: type=text + -webkit-text-security 마스킹
+    assertEq(apiKeyInput.type, 'text', 'apiKey 입력은 자동완성을 막기 위해 type=text여야 함');
+    assertEq(customKeyInput.type, 'text', 'customApiKey 입력도 type=text여야 함');
+    var sec = getComputedStyle(apiKeyInput).webkitTextSecurity || apiKeyInput.style.webkitTextSecurity ||
+      apiKeyInput.getAttribute('style') || '';
+    assertTrue(sec.indexOf('disc') !== -1, 'apiKey 입력에 -webkit-text-security:disc 마스킹이 있어야 함 (관측: ' + sec + ')');
+
+    // 자동완성 시뮬레이션: 저장된 디스코드 비밀번호가 채워졌다고 가정
+    apiKeyInput.value = 'MyDiscordPw13';
+
+    var handleCount = 0;
+    var origHandle = D.MockApi.handle;
+    D.MockApi.handle = function () { handleCount++; return origHandle.apply(this, arguments); };
+
+    // (B) 연결 테스트는 형식 오류로 즉시 거부되고 MockApi를 호출하지 않아야 함
+    var resultEl = shadow.querySelector('#dcxlt-conntest');
+    shadow.querySelector('[data-act="test-connection"]').click();
+    assertTrue((resultEl.textContent || '').indexOf('형식') !== -1, '형식 오류 메시지가 떠야 함 (관측: ' + resultEl.textContent + ')');
+    assertEq(handleCount, 0, '형식이 틀린 키로는 MockApi가 호출되면 안 됨');
+
+    // (C) 저장 버튼도 거부하고 기존 저장된 키를 보존해야 함
+    document.querySelectorAll('.dcxlt-toast').forEach(function (n) { if (n.parentNode) n.parentNode.removeChild(n); });
+    shadow.querySelector('[data-act="save-general"]').click();
+    assertEq(D.State.apiKey, 'sk-ant-harness', '형식이 틀린 typed 값은 저장되지 않고 기존 키가 유지되어야 함');
+    var toastEl = document.querySelector('.dcxlt-toast');
+    assertTrue(!!toastEl && toastEl.textContent.indexOf('sk-ant-') !== -1,
+      '자동완성 거부 안내 토스트가 떠야 함 (관측: ' + (toastEl && toastEl.textContent) + ')');
+
+    D.MockApi.handle = origHandle;
+
+    // (D) 올바른 형식의 키는 정상 저장되어야 함
+    apiKeyInput.value = 'sk-ant-new-1234';
+    shadow.querySelector('[data-act="save-general"]').click();
+    assertEq(D.State.apiKey, 'sk-ant-new-1234', '올바른 형식의 키는 저장되어야 함');
+
+    // (E) 재오픈 시 입력칸이 (비동기 자동완성 대비 300ms 재클리어 포함) 비어 있어야 함
+    D.UI.openSettings('일반');
+    await sleep(400);
+    var reopened = shadow.querySelector('[data-f="apiKey"]');
+    assertEq(reopened.value, '', '재오픈 후 400ms 뒤에는 입력칸이 비어 있어야 함');
   });
 
   // ---- runner ----------------------------------------------------------
