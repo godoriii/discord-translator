@@ -112,6 +112,7 @@
     var d = DX();
     d.State.queue.queued = [];
     d.State.queue._inflightBatches = [];
+    d.State.queue._pendingParts = [];
     d.State.queue.inflightCount = 0;
     // Cancel pending backoff retries from the previous scenario — an
     // orphaned _scheduleRetry timer fires mid-scenario and injects a stale
@@ -204,7 +205,7 @@
   var msgIdCounter = 1;
   function freshId() { return '30000000000' + String(msgIdCounter++).padStart(7, '0'); }
 
-  // ---- 38 scenarios ----------------------------------------------------------
+  // ---- 39 scenarios ----------------------------------------------------------
   var scenarios = [];
 
   function scenario(name, fn) { scenarios.push({ name: name, fn: fn }); }
@@ -890,6 +891,30 @@
     for (var j = 1; j < ids.length; j++) {
       assertEq(blockEl(ids[j]).dataset.state, 'error', ids[j] + '은 재시도하지 않았으므로 계속 error로 남아있어야 함');
     }
+  });
+
+  scenario('39. max_tokens(200) ↔ 429 교대 시 되병합 무한루프 방지 (서킷브레이커 발동, 호출 유계)', async function () {
+    resetState({ mockApi: 'maxtokens_ratelimit' });
+    var D = DX();
+    var calls = 0, sizes = [];
+    var origHandle = D.MockApi.handle;
+    D.MockApi.handle = function () { var r = origHandle.apply(D.MockApi, arguments); calls++; sizes.push(D.MockApi._lastItems.length); return r; };
+    var ids = [];
+    try {
+      for (var i = 0; i < 8; i++) { var id = freshId(); ids.push(id); addMessage({ msgId: id, text: 'maxtokens ratelimit test ' + i }); }
+      forceReconcile();
+      // 서킷브레이커(consecutiveRateLimits >= 3)가 걸릴 때까지 대기 — 걸리면 pausedUntil이 멀리 잡힌다
+      var tripped = await wait(function () { return D.State.queue.consecutiveRateLimits >= 3; }, 8000);
+      var callsAtTrip = calls;
+      await sleep(3000);   // 루프가 살아있으면 이 동안 호출이 계속 늘어난다
+    } finally { D.MockApi.handle = origHandle; }
+    assertTrue(tripped, '429 연속 3회로 서킷브레이커가 발동해야 함(consecutiveRateLimits=' + D.State.queue.consecutiveRateLimits + ')');
+    assertTrue(calls <= 8, '호출 수가 유계여야 함(관측 ' + calls + ', 크기 ' + JSON.stringify(sizes) + ')');
+    assertEq(calls, callsAtTrip, '브레이커 발동 후 3초 동안 추가 호출이 없어야 함(발동 시 ' + callsAtTrip + ' → ' + calls + ')');
+    assertTrue(D.State.queue.pausedUntil - D.Util.now() > 20000, '브레이커가 장기 일시정지를 걸어야 함');
+    assertTrue(!sizes.slice(1).some(function (n) { return n >= 5; }), '첫 배치 이후 실패한 크기(≥5)로 되병합되면 안 됨(관측 ' + JSON.stringify(sizes) + ')');
+    assertEq(D.State.queue.failed.size, 0, '429는 실패 확정이 아니어야 함');
+    ids.forEach(function (id) { assertEq(blockEl(id).dataset.state, 'loading', id + ' 블록은 loading 대기여야 함'); });
   });
 
   // ---- runner ----------------------------------------------------------

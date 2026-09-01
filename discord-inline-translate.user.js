@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Inline Translator (KO)
 // @namespace    https://github.com/godoriii/discord-translator
-// @version      0.2.0
+// @version      0.2.1
 // @description  디스코드 웹 채팅을 사용자 용어집 기반으로 한국어 인라인 번역
 // @match        https://discord.com/*
 // @match        https://ptb.discord.com/*
@@ -31,7 +31,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '0.2.0';
+  var SCRIPT_VERSION = '0.2.1';
 
   // ===== 1. CONSTANTS =====
   var C = {
@@ -185,7 +185,11 @@
       // harness's resetState) can cancel them — an orphaned retry timer
       // fires later and silently re-queues a batch into state that has
       // since been cleared.
-      retryTimers: new Set()
+      retryTimers: new Set(),
+      // Bisected halves waiting for a concurrency slot. They are in neither
+      // `queued` nor `_inflightBatches`, so Queue.has() must look here too or
+      // reconcile enqueues a duplicate for a message already being retried.
+      _pendingParts: []
     },
     recentByChannel: new Map(),
     previousSeen: new Set(),
@@ -1551,6 +1555,17 @@
         if (manualRetry) return okResponse();
         return maxTokensResponse();
       }
+      if (mode === 'maxtokens_ratelimit') {
+        // Batches of 5+ overflow the output budget (max_tokens, HTTP 200);
+        // anything smaller always 429s — no rateLimitFired one-shot guard,
+        // so every sub-5 batch 429s, every time. Together this reproduces
+        // the max_tokens(200) <-> 429 alternation that used to livelock via
+        // _bisect -> _requeueSameBatch -> packer re-merge into the same
+        // oversized batch.
+        if (manualRetry) return okResponse();
+        if (batchLen >= 5) return maxTokensResponse();
+        return { status: 429, headers: 'retry-after: 1', json: { error: { message: 'rate limited' } } };
+      }
       if (mode === 'partial' || mode === 'scramble') return okResponse();
       if (mode === 'slow') return okResponse();
       return okResponse();
@@ -1597,6 +1612,12 @@
           if (b.some(function (it) { return it.msgId === msgId && it.hash === hash; })) return true;
         }
       }
+      if (State.queue._pendingParts) {
+        for (var j = 0; j < State.queue._pendingParts.length; j++) {
+          var pp = State.queue._pendingParts[j];
+          if (pp.some(function (it) { return it.msgId === msgId && it.hash === hash; })) return true;
+        }
+      }
       return false;
     },
     dropChannel: function (channelId) {
@@ -1606,6 +1627,7 @@
       var now = Util.now();
       if (now < State.queue.pausedUntil) return;
       if (State.queue.inflightCount >= State.queue.currentConcurrency) return;
+      if (State.queue._pendingParts && State.queue._pendingParts.length) return;
       if (!State.queue.queued.length) return;
 
       var pool = State.queue.queued.slice().sort(function (a, b) {
@@ -1618,15 +1640,18 @@
       var readyByAge = (now - oldest.enqueuedAt) >= C.BATCH_MAX_WAIT_MS;
       if (!(readyByDebounce || readyByCount || readyByAge)) return;
 
-      var batch = [], chars = 0;
+      var batch = [], chars = 0, cap = C.BATCH_MAX_ITEMS;
       for (var i = 0; i < pool.length; i++) {
         var it = pool[i];
+        var lim = Math.min(cap, it.maxBatch || C.BATCH_MAX_ITEMS);
+        if (batch.length >= lim) break;
         if (it.rawLen > C.SOLO_ITEM_CHARS && batch.length > 0) break;
         if (chars + it.text.length > C.BATCH_MAX_CHARS && batch.length > 0) break;
         batch.push(it);
         chars += it.text.length;
+        cap = lim;
         if (it.rawLen > C.SOLO_ITEM_CHARS) break;
-        if (batch.length >= C.BATCH_MAX_ITEMS) break;
+        if (batch.length >= cap) break;
       }
       var batchIds = batch.map(function (it) { return it.msgId + '|' + it.hash; });
       State.queue.queued = State.queue.queued.filter(function (it) { return batchIds.indexOf(it.msgId + '|' + it.hash) === -1; });
@@ -1647,7 +1672,6 @@
     onResponse: function (batch, res) {
       Api.recordUsage(res.json && res.json.usage);
       if (res.status === 200 && res.json) {
-        State.queue.consecutiveRateLimits = 0;
         var stopReason = res.json.stop_reason;
         if (stopReason === 'refusal') {
           batch.forEach(function (it) { Queue._markFailed(it, 'refusal'); });
@@ -1666,6 +1690,11 @@
           Queue._markFailed(batch[0], 'parse');
           return;
         }
+        // Only a response that actually commits translations resets the
+        // breaker — an any-200 reset (including a non-committing max_tokens
+        // response) let a max_tokens<->429 alternation keep the breaker from
+        // ever arming (measured: ~3 req/s livelock, see scenario 39).
+        State.queue.consecutiveRateLimits = 0;
         var byIndex = {};
         parsed.translations.forEach(function (t) {
           if (typeof t.i === 'number' && t.i >= 0 && t.i < batch.length && !(t.i in byIndex)) byIndex[t.i] = t;
@@ -1737,19 +1766,52 @@
       // failure paths in onResponse still fire.
       var mid = Math.ceil(batch.length / 2);
       var parts = [batch.slice(0, mid), batch.slice(mid)].filter(function (p) { return p.length; });
-      var sendParts = function () {
-        // Direct sends skip the queue, so honor the two queue-level gates
-        // ourselves: a disabled client must not fire requests (same silent
-        // drop as _stopAll), and a backoff pause must delay the halves.
-        if (!cfg.enabled) return;
-        var wait = (State.queue.pausedUntil || 0) - Util.now();
-        if (wait > 0) { setTimeout(sendParts, wait + 20); return; }
-        parts.forEach(function (part) {
-          part.forEach(function (it) { it.enqueuedAt = Util.now(); });
-          Queue._send(part);
+      // Direct sends are not the only way a half reaches the queue again: a
+      // 429/5xx/parse-failure on a half goes through _requeueSameBatch, and
+      // from there the packer WOULD re-merge it into the same oversized batch
+      // that just failed. Cap each half at the size that is still being tried,
+      // so no requeue path can rebuild the failing batch.
+      parts.forEach(function (part) {
+        part.forEach(function (it) {
+          it.maxBatch = Math.min(it.maxBatch || C.BATCH_MAX_ITEMS, part.length);
         });
+      });
+      State.queue._pendingParts = State.queue._pendingParts || [];
+      parts.forEach(function (p) { State.queue._pendingParts.push(p); });
+      var release = function (part) {
+        var i = State.queue._pendingParts.indexOf(part);
+        if (i !== -1) State.queue._pendingParts.splice(i, 1);
+        return i !== -1;
       };
-      sendParts();
+      var pump = function () {
+        // Direct sends skip the queue, so honor the queue-level gates here:
+        // a disabled client must not fire (same silent drop as _stopAll), a
+        // backoff pause must delay the halves, and the concurrency ceiling
+        // must hold — firing both halves at once doubled the in-flight count
+        // at every level, peaking at MAX_CONCURRENT × BATCH_MAX_ITEMS.
+        if (!cfg.enabled) { parts.slice().forEach(release); parts.length = 0; return; }
+        while (parts.length) {
+          var now = Util.now();
+          var wait = (State.queue.pausedUntil || 0) - now;
+          if (wait > 0) { Queue._armPump(pump, wait + 20); return; }
+          if (State.queue.inflightCount >= State.queue.currentConcurrency) { Queue._armPump(pump, 60); return; }
+          var part = parts.shift();
+          // A part removed externally (_stopAll / reset) is stale — skip it.
+          if (!release(part)) continue;
+          part.forEach(function (it) { it.enqueuedAt = now; });
+          Queue._send(part);
+        }
+      };
+      pump();
+    },
+    // Same tracking contract as _scheduleRetry: a re-arm timer that outlives a
+    // stop/reset would fire into cleared state (HANDOFF v0.1.2 fix #5).
+    _armPump: function (fn, delay) {
+      var tid = setTimeout(function () {
+        State.queue.retryTimers.delete(tid);
+        fn();
+      }, delay);
+      State.queue.retryTimers.add(tid);
     },
     _requeueSingle: function (item) {
       if ((item._partialRetries || 0) >= 1) { Queue._markFailed(item, 'partial'); return; }
@@ -1773,6 +1835,7 @@
       // was just disabled (e.g. after an auth failure).
       State.queue.retryTimers.forEach(function (t) { clearTimeout(t); });
       State.queue.retryTimers.clear();
+      State.queue._pendingParts = [];
     },
     retry: function (msgId) {
       var f = State.queue.failed.get(msgId);
@@ -1781,6 +1844,7 @@
       var item = f.item;
       item.attempts = 0;
       item._partialRetries = 0;
+      item.maxBatch = 0;
       item.manualRetry = true;
       MockApi._manualRetryFlag = true;
       item.enqueuedAt = Util.now();
