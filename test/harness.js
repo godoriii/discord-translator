@@ -55,7 +55,8 @@
     glossaryUrl: 'https://example.invalid/glossary.json', glossaryAutoRefresh: false,
     glossaryStrategy: 'auto', glossaryAudit: true,
     cacheTtl: '1h', translateEmbeds: true, backfillMode: 'viewport', contextMessages: 3,
-    showOriginal: true, hotkeyToggle: 'Alt+KeyT', hotkeyTranslateView: 'Alt+Shift+KeyT', perChannelOff: [],
+    showOriginal: true, hotkeyToggle: 'Alt+KeyT', hotkeyTranslateView: 'Alt+Shift+KeyT', hotkeyHistory: 'Alt+KeyH', perChannelOff: [],
+    showWidget: true,
     fontScale: 0.875, debug: true, mockApi: 'ok',
     provider: 'anthropic', customBaseUrl: '', customModel: '', customHeaders: ''
   };
@@ -128,6 +129,9 @@
     d.State.queue.currentConcurrency = 1;
     d.Queue.stats();
     d.State.tcacheMap.clear();
+    if (d.History) d.History.clear();
+    if (d.State.chNames) d.State.chNames.clear();
+    if (d.HistoryUI) { d.HistoryUI._filter = { q: '', ch: '' }; d.HistoryUI.close(); }
     d.State.previousSeen = new Set();
     d.State.recentByChannel.clear();
     d.State.viewport.dwelled.clear();
@@ -188,6 +192,16 @@
 
   function contentEl(msgId) { return document.getElementById('message-content-' + msgId); }
   function blockEl(msgId) { return DX().Render.blockFor(String(msgId)); }
+  function historyHost() { return document.getElementById('dcxlt-history-host'); }
+  function historyShadow() { var h = historyHost(); return h && h.shadowRoot; }
+  function historyRows() {
+    var s = historyShadow();
+    return s ? Array.prototype.slice.call(s.querySelectorAll('[data-h-row]')) : [];
+  }
+  function widgetShadow() {
+    var h = document.getElementById('dcxlt-widget-host');
+    return h && h.shadowRoot;
+  }
 
   function forceReconcile() { DX().reconcile(); }
 
@@ -1019,6 +1033,273 @@
     D.Store.setApiKey('');
     D.UI.openSettings('일반');
     assertEq(hint.textContent, '저장된 키 없음', '키를 비우면 힌트가 없음으로 바뀌어야 함');
+  });
+
+  scenario('43. 번역 기록 적재 + 중복 제거 + 상한', async function () {
+    resetState();
+    var D = DX();
+    assertEq(D.History.all().length, 0, 'resetState 후 기록은 비어 있어야 함');
+
+    var ids = [freshId(), freshId(), freshId()];
+    ids.forEach(function (id, i) { addMessage({ msgId: id, text: 'history append message ' + i, author: '테스터' }); });
+    forceReconcile();
+    var ok = await wait(function () { return ids.every(function (id) { var b = blockEl(id); return b && b.dataset.state === 'done'; }); }, 20000);
+    assertTrue(ok, '3건 모두 번역 완료되어야 함');
+    await wait(function () { return D.History.all().length === 3; }, 2000);
+    assertEq(D.History.all().length, 3, '커밋 3건이 기록에 적재되어야 함');
+
+    var item = D.Extract.fromContentNode(contentEl(ids[0]));
+    var e = D.History.get(ids[0], item.hash);
+    assertTrue(!!e, 'id+hash로 조회되어야 함');
+    assertEq(e.id, ids[0], 'id');
+    assertEq(e.ch, CH, 'channelId');
+    assertEq(e.g, '999999999999999999', 'guildId가 pathname에서 추출되어야 함');
+    assertEq(e.au, '테스터', 'author');
+    assertEq(e.m, 'claude-opus-5', 'model');
+    assertEq(e.h, item.hash, 'hash');
+    assertEq(e.src, 'history append message 0', '평문 원문');
+    assertTrue(e.ko.length > 0, 'ko 비어있지 않아야 함');
+    assertEq(typeof e.mt, 'number', 'mt는 숫자');
+    assertTrue(e.mt > 1420070400000, 'mt는 디스코드 에포크 이후여야 함 (관측: ' + e.mt + ')');
+    assertTrue(e.tt >= e.mt || e.tt > 1420070400000, 'tt는 번역 시각');
+
+    // 같은 id+hash 재적재는 교체(중복 생성 아님)
+    var beforeLen = D.History.all().length;
+    var t0 = e.tt;
+    D.History.append(Object.assign({}, e, { tt: t0 + 5000 }));
+    assertEq(D.History.all().length, beforeLen, 'id+hash 중복은 항목 수를 늘리지 않아야 함');
+    assertEq(D.History.get(ids[0], item.hash).tt, t0 + 5000, '재번역은 기존 항목을 갱신해야 함');
+
+    // 한국어 메시지(skip)는 기록되지 않는다
+    var koId = freshId();
+    addMessage({ msgId: koId, text: '이건 이미 한국어 문장입니다 번역 불필요' });
+    forceReconcile();
+    await sleep(600);
+    assertEq(D.History.all().filter(function (x) { return x.id === koId; }).length, 0, 'skip 항목은 기록되지 않아야 함');
+
+    // 항목 수 상한 (FIFO by tt)
+    var origMax = D.C.HISTORY_MAX_ENTRIES;
+    D.C.HISTORY_MAX_ENTRIES = 5;
+    for (var i = 0; i < 8; i++) {
+      D.History.append({ id: 'bulk' + i, ch: CH, g: '', au: 'x', src: 's' + i, ko: 'k' + i, ph: [], gt: [], gv: '', hs: false, k: 'chat', mt: 1500000000000 + i, tt: 1500000000000 + i, m: 'm', h: 'h' + i });
+    }
+    D.History.flush(true);
+    D.C.HISTORY_MAX_ENTRIES = origMax;
+    assertEq(D.History.all().length, 5, '상한 5건으로 잘려야 함 (관측: ' + D.History.all().length + ')');
+    assertTrue(!D.History.get('bulk0', 'h0'), '가장 오래된 tt 항목이 먼저 축출되어야 함');
+    assertTrue(!!D.History.get('bulk7', 'h7'), '가장 최신 항목은 남아야 함');
+  });
+
+  scenario('44. 기록 폴백 렌더 (캐시 비우기 / 모델 변경 후에도 살아남음)', async function () {
+    resetState();
+    var D = DX();
+    var id = freshId();
+    var html = 'Check ' + window.Fixtures.mkMention('@Tester') + ' and ' +
+      window.Fixtures.mkLink('https://example.com/x', 'the link') + ' now';
+    addMessage({ msgId: id, html: html });
+    forceReconcile();
+    var ok = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'done'; }, 20000);
+    assertTrue(ok, '최초 번역이 완료되어야 함');
+    var baseline = blockEl(id).querySelector('.dcxlt-text').innerHTML;
+    var item = D.Extract.fromContentNode(contentEl(id));
+    await wait(function () { return !!D.History.get(id, item.hash); }, 2000);
+    var reqsBefore = D.State.stats.reqs;
+
+    // (1) 캐시 비우기 후 복원
+    D.TCache.clear();
+    D.Render.remove(id);
+    assertTrue(!blockEl(id), '블록이 제거된 상태여야 함');
+    forceReconcile();
+    var ok1 = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'done'; }, 3000);
+    assertTrue(ok1, 'TCache.clear() 후에도 기록에서 즉시 복원되어야 함');
+    assertEq(D.State.stats.reqs, reqsBefore, '복원에는 API 호출이 없어야 함');
+    assertEq(blockEl(id).querySelector('.dcxlt-text').innerHTML, baseline, '멘션/링크까지 원래 렌더와 동일해야 함');
+    assertTrue(!!D.TCache.get(D.TCache.key(id, item.hash)), '복원 시 TCache가 현재 키로 다시 데워져야 함');
+
+    // (2) 모델 변경 후 복원 (TCache 키가 통째로 고아가 되는 상황)
+    D.Store.saveSettings({ model: 'claude-sonnet-5' });
+    D.TCache.clear();
+    D.Render.remove(id);
+    forceReconcile();
+    var ok2 = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'done'; }, 3000);
+    assertTrue(ok2, '모델 변경 후에도 기록에서 복원되어야 함');
+    assertEq(D.State.stats.reqs, reqsBefore, '모델 변경 복원에도 API 호출이 없어야 함');
+    var newKey = D.TCache.key(id, item.hash);
+    assertTrue(newKey.indexOf('claude-sonnet-5') !== -1, '새 모델 키여야 함 (관측: ' + newKey + ')');
+    assertTrue(!!D.TCache.get(newKey), '새 모델 키로 TCache가 데워져야 함');
+    var restored = blockEl(id).querySelector('.dcxlt-text');
+    assertTrue(!!restored.querySelector('a'), '링크 자리표시자가 복원되어야 함');
+    assertTrue(!!restored.querySelector('[role="link"]'), '멘션 자리표시자가 복원되어야 함');
+    D.Store.saveSettings({ model: 'claude-opus-5' });
+  });
+
+  scenario('45. 번역 기록 오버레이 (열기/검색/필터/내보내기/삭제/전체 지우기)', async function () {
+    resetState();
+    var D = DX();
+    var ids = [freshId(), freshId(), freshId()];
+    var words = ['zebra', 'walrus', 'penguin'];
+    ids.forEach(function (id, i) { addMessage({ msgId: id, text: 'the ' + words[i] + ' appears here' }); });
+    forceReconcile();
+    var ok = await wait(function () { return ids.every(function (id) { var b = blockEl(id); return b && b.dataset.state === 'done'; }); }, 20000);
+    assertTrue(ok, '3건 번역 완료');
+    await wait(function () { return D.History.all().length === 3; }, 2000);
+    // 다른 채널 항목 1건 (직접 적재 — Router는 URL 기준이라 DOM만으로는 안 바뀜)
+    D.History.append({ id: '300000009999999', ch: '222222222222222222', cn: '', g: '999999999999999999',
+      au: 'OtherGuy', src: 'other channel narwhal line', ko: '다른 채널 줄', ph: [], gt: [], gv: '',
+      hs: false, k: 'chat', mt: 1600000000000, tt: 1600000000000, m: 'claude-opus-5', h: 'zz1' });
+    assertEq(D.History.all().length, 4, '총 4건');
+
+    window.__DCXLT_MENU__['번역 기록']();
+    var host = historyHost();
+    assertTrue(!!host, '#dcxlt-history-host가 생성되어야 함');
+    assertEq(host.hidden, false, '오버레이가 열려야 함');
+    var sh = historyShadow();
+    assertEq(historyRows().length, 4, '행 4개 (관측: ' + historyRows().length + ')');
+    assertEq(sh.querySelector('[data-el="count"]').textContent, '4 / 4건', '카운트 라벨');
+
+    // 검색
+    var q = sh.querySelector('[data-el="q"]');
+    q.value = 'WALRUS';
+    q.dispatchEvent(new Event('input', { bubbles: true }));
+    var okQ = await wait(function () { return historyRows().length === 1; }, 1500);
+    assertTrue(okQ, '대소문자 무시 검색으로 1건만 남아야 함 (관측: ' + historyRows().length + ')');
+    assertEq(sh.querySelector('[data-el="count"]').textContent, '1 / 4건', '검색 중 카운트');
+    q.value = '';
+    q.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(function () { return historyRows().length === 4; }, 1500);
+
+    // 채널 필터
+    var sel = sh.querySelector('[data-el="chsel"]');
+    assertEq(sel.options.length, 3, '모든 채널 + 채널 2개 = 3개 옵션 (관측: ' + sel.options.length + ')');
+    sel.value = '222222222222222222';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    assertEq(historyRows().length, 1, '채널 필터로 1건 (관측: ' + historyRows().length + ')');
+    sel.value = '';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    assertEq(historyRows().length, 4, '필터 해제 시 4건');
+
+    // 내보내기 (실제 다운로드 대신 _download를 스텁)
+    var captured = null;
+    var origDl = D.HistoryUI._download;
+    D.HistoryUI._download = function (fn, text, mime) { captured = { fn: fn, text: text, mime: mime }; };
+    sh.querySelector('[data-act="export-txt"]').click();
+    assertEq(captured.fn, 'dcxlt-history.txt', 'txt 파일명');
+    assertTrue(captured.text.indexOf('zebra') !== -1, 'txt에 원문이 포함되어야 함');
+    assertTrue(captured.text.indexOf('원문:') !== -1, 'txt 포맷 헤더');
+    sh.querySelector('[data-act="export-json"]').click();
+    assertEq(captured.fn, 'dcxlt-history.json', 'json 파일명');
+    var parsed = JSON.parse(captured.text);
+    assertEq(parsed.length, 4, 'json 항목 4건');
+    assertEq(parsed[0].id !== undefined, true, 'json 항목에 id가 있어야 함');
+    D.HistoryUI._download = origDl;
+
+    // 개별 삭제
+    historyRows()[0].querySelector('[data-act="del"]').click();
+    assertEq(historyRows().length, 3, '삭제 후 행 3개');
+    assertEq(D.History.all().length, 3, '스토어에서도 삭제');
+
+    // 전체 지우기 (2단계 버튼, window.confirm 없음)
+    var clearBtn = sh.querySelector('[data-act="clear"]');
+    clearBtn.click();
+    assertEq(clearBtn.textContent, '정말 지울까요?', '1차 클릭은 확인 문구로 바뀌어야 함');
+    assertEq(D.History.all().length, 3, '1차 클릭만으로는 지워지지 않아야 함');
+    clearBtn.click();
+    assertEq(D.History.all().length, 0, '2차 클릭에서 전부 삭제');
+    assertEq(historyRows().length, 0, '행 0개');
+    assertEq(clearBtn.textContent, '기록 지우기', '버튼 라벨 복구');
+
+    // TCache와 분리되어 있는지: 캐시 비우기는 기록을 지우지 않는다
+    D.History.append({ id: 'sep1', ch: CH, g: '', au: '', src: 's', ko: 'k', ph: [], gt: [], gv: '',
+      hs: false, k: 'chat', mt: 1600000000000, tt: 1600000000000, m: 'm', h: 'hh' });
+    window.__DCXLT_MENU__['캐시 비우기']();
+    assertEq(D.History.all().length, 1, '캐시 비우기는 번역 기록을 지우지 않아야 함');
+
+    // Esc 닫기
+    host.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    assertEq(host.hidden, true, 'Esc로 닫혀야 함');
+  });
+
+  scenario('46. 스크롤업 중 도착한 메시지 + 플로팅 위젯 즉시 번역', async function () {
+    resetState({ backfillMode: 'viewport' });
+    var D = DX();
+
+    // --- (A) Part1 회귀: 스크롤업 중 마운트된 메시지가 하단 복귀 후 즉시 번역되어야 함 ---
+    var spacer = document.createElement('div');
+    spacer.style.height = '3000px';
+    chatRootEl().appendChild(spacer);
+    var scroller = D.State.detect.scroller;
+    var id = freshId();
+    addMessage({ msgId: id, text: 'arrived while user was scrolled up' });
+    if (scroller) scroller.scrollTop = 0;          // 사용자는 위를 보고 있다
+    forceReconcile();
+    await sleep(300);
+    assertTrue(!blockEl(id), '스크롤업 상태에서는 아직 번역되지 않아야 함');
+    assertEq(D.State.previousSeen.has(id), false,
+      '처리되지 않은 메시지는 previousSeen에 들어가면 안 됨 (수정 전에는 true라 영구 강등됨)');
+    assertEq(D.State.viewport.dwelled.has(id), false, 'dwell은 아직 없어야 함');
+
+    if (scroller) scroller.scrollTop = scroller.scrollHeight;   // 하단으로 복귀
+    forceReconcile();
+    var okA = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'done'; }, 8000);
+    assertTrue(okA, '하단 복귀 시 dwell/예산 없이 즉시 번역되어야 함 (수정 전에는 영영 안 됨)');
+    assertEq(D.State.viewport.bucket.count, 0, '라이브 경로(priority 0)라 백필 예산을 쓰지 않아야 함');
+
+    // --- (B) 위젯: 백필이 막아둔 메시지를 버튼 한 번으로 번역 ---
+    resetState({ backfillMode: 'off' });
+    var sp2 = document.createElement('div');
+    sp2.style.height = '3000px';
+    chatRootEl().appendChild(sp2);
+    var ids = [freshId(), freshId()];
+    ids.forEach(function (x) { addMessage({ msgId: x, text: 'widget target message ' + x }); });
+    var sc2 = D.State.detect.scroller;
+    if (sc2) sc2.scrollTop = 0;
+    forceReconcile();
+    await sleep(300);
+    assertTrue(ids.every(function (x) { return !blockEl(x); }), 'backfill off + 뷰포트 밖이면 자동 번역이 없어야 함');
+
+    var wsh = widgetShadow();
+    assertTrue(!!wsh, '#dcxlt-widget-host 그림자 루트가 있어야 함');
+    assertEq(wsh.querySelector('.lbl').textContent, '▶ 번역', '기본 라벨');
+    wsh.querySelector('[data-act="go"]').click();
+    var okB = await wait(function () { return ids.every(function (x) { var b = blockEl(x); return b && b.dataset.state === 'done'; }); }, 10000);
+    assertTrue(okB, '위젯 버튼으로 화면의 메시지가 번역되어야 함');
+
+    // --- (C) 꺼짐 상태 표시 + 클릭으로 재활성화 ---
+    D.Store.saveSettings({ enabled: false });
+    D.Widget.refresh();
+    assertEq(wsh.querySelector('.lbl').textContent, '⏸ 꺼짐', '비활성 상태 라벨');
+    assertEq(wsh.querySelector('.go').getAttribute('data-tone'), 'off', '비활성 톤');
+    wsh.querySelector('[data-act="go"]').click();
+    assertEq(D.cfg.enabled, true, '꺼짐 상태에서 클릭하면 다시 켜져야 함');
+    assertEq(wsh.querySelector('.lbl').textContent, '▶ 번역', '재활성 후 라벨 복구');
+
+    // --- (D) showWidget=false 로 숨김 ---
+    D.Store.saveSettings({ showWidget: false });
+    D.Widget.apply();
+    assertEq(document.getElementById('dcxlt-widget-host'), null, 'showWidget=false면 위젯이 제거되어야 함');
+    D.Store.saveSettings({ showWidget: true });
+    D.Widget.apply();
+    assertTrue(!!document.getElementById('dcxlt-widget-host'), 'showWidget=true면 다시 나타나야 함');
+
+    // --- (E) Alt+T 재활성화가 즉시 reconcile 하는지 ---
+    resetState();
+    var eId = freshId();
+    addMessage({ msgId: eId, text: 'alt t immediate reconcile check' });
+    forceReconcile();
+    await wait(function () { var b = blockEl(eId); return b && b.dataset.state === 'done'; }, 8000);
+    document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyT', altKey: true, bubbles: true, cancelable: true }));
+    await sleep(50);
+    assertEq(D.cfg.enabled, false, 'Alt+T로 꺼짐');
+    D.TCache.clear();
+    var e2 = freshId();
+    addMessage({ msgId: e2, text: 'added while translation disabled here' });
+    forceReconcile();
+    await sleep(150);
+    assertTrue(!blockEl(e2), '꺼진 동안에는 번역되지 않아야 함');
+    document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyT', altKey: true, bubbles: true, cancelable: true }));
+    await sleep(80);
+    assertTrue(D.State.queue.queued.length > 0 || D.State.queue.inflightCount > 0 || !!blockEl(e2),
+      'Alt+T 재활성화는 1500ms 인터벌을 기다리지 않고 즉시 reconcile 해야 함');
   });
 
   // ---- runner ----------------------------------------------------------

@@ -1,6 +1,6 @@
 # HANDOFF — 다른 기기에서 이어서 작업하기
 
-> 최종 갱신: 2026-09-01 오후 (집 컴퓨터 세션). v0.2.2 — 키 없는 첫 사용 함정 제거(키 가드/401 자동 재활성화/연결 테스트, 시나리오 40-42 추가), 하네스 43/43 클린 통과.
+> 최종 갱신: 2026-09-01 (집 컴퓨터 세션). v0.3.0 — "매번 새로고침해야 한다" 근본 원인 수정(`previousSeen` 영구 강등 버그), 영구 번역 기록(`History`)과 폴백 렌더, 플로팅 위젯, 번역 기록 오버레이 추가. 시나리오 43-46 추가, 하네스 47/47 클린 통과.
 
 ## 이 프로젝트가 무엇인가
 Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 메시지를 Claude API로 한국어 인라인 번역하고, 사용자 용어집(`glossary.json`, WoW 공식 한국어 명칭)을 강제 적용한다. Windows/Mac 동일 스크립트 한 벌, GitHub raw URL로 자동 업데이트.
@@ -42,7 +42,7 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
     --enable-logging=stderr --v=0 \
     "http://127.0.0.1:8899/test/harness.html?autorun=1" 2>&1 | grep DCXLT_SUMMARY
   ```
-  `DCXLT_SUMMARY pass=43 fail=0 skipped=0 xhr=0` 이 나와야 한다 (42 시나리오 + 네트워크 어서션 = 43). (완주 후 크롬은 직접 kill)
+  `DCXLT_SUMMARY pass=47 fail=0 skipped=0 xhr=0` 이 나와야 한다 (46 시나리오 + 네트워크 어서션 = 47). (완주 후 크롬은 직접 kill)
   - 참고: `--virtual-time-budget`은 영구 setInterval과 상극이라 여전히 금지. 위처럼 실시간 타이머 + 스로틀링 비활성 플래그로 돌린다.
   - 하네스 디버그 파라미터: `&only=3,17,28`(부분 실행), `&spy=1`(큐 이벤트 `DCXLT_TRACE` 콘솔 트레이스), 완주 시 `DCXLT_RESULTS <json>` 콘솔 라인으로 시나리오별 결과 수집 가능.
 - 포그라운드 브라우저에서 보고 싶으면: `http://127.0.0.1:8899/test/harness.html` 을 **화면에 보이는 탭**으로 열고 `await __DCXLT_TEST__.runAll()`. (hidden 탭은 타이머 스로틀링 때문에 타이밍 시나리오가 가짜로 실패한다 — 이전 세션의 "백그라운드 28/34"가 그것)
@@ -78,6 +78,41 @@ Codex/Opus 교차 검증: Codex는 "피크가 BATCH_MAX_ITEMS=8로 유계이니 
 
 시나리오 40(키 없음 → 0건 + 안내 → 키 저장 즉시 시작), 41(401 → 자동 재활성화 → 패널 경로 회귀 방지), 42(연결 테스트 버튼) 추가. 하네스 42 시나리오, 43/43 PASS(네트워크 어서션 포함) 2회 연속.
 
+## v0.3.0 — "매번 새로고침해야 하나" 근본 수정 + 영구 번역 기록 + 위젯 (2026-09-01)
+
+### 근본 원인 (BUG #1, 헤드라인)
+
+`reconcile()`의 per-node 루프가 마운트된 메시지 id를 **무조건** `seen`에 추가한 뒤, 스윕 끝에서 `State.previousSeen = seen`으로 통째로 교체했다. `decidePriority`의 `nearBottom && isNewlyMounted → priority 0`(라이브 경로)은 "방금 마운트됐다"는 자격을 **꼭 한 번의 스윕**에서만 쓸 수 있는데, 사용자가 스크롤을 올린 상태(`nearBottom=false`)에서 메시지가 마운트되면 그 스윕에서 아무것도 처리하지 못하면서도 `seen`엔 id가 기록돼 다음 스윕부턴 영원히 "새로 마운트된 게 아님" 취급을 받았다. 남은 경로는 400ms dwell + 분당 40건 백필 버킷뿐인데, 스크롤업 직후엔 그 버킷이 이미 비어 있는 경우가 흔해 메시지가 **영구히 번역되지 않고 멈췄다.** 새로고침만이 `previousSeen`을 초기화해 모든 메시지를 다시 "새로 마운트됨"으로 만드는 유일한 사용자 접근 경로였다 — 이것이 "매번 새로고침해야 번역된다"의 정체.
+
+실측 (계측된 프로브, 수정 전/후 동일 빌드):
+```
+BEFORE  D after 1s scrolled-up:    enq=0 block=none previousSeen.has=true
+        D after scroll-to-bottom:  enq=0 block=none            ← 영구 정체
+AFTER   D after 1s scrolled-up:    enq=0 block=none previousSeen.has=false
+        D after scroll-to-bottom:  enq=1 block=done
+        D DONE-WITHOUT-DWELL ms=0                              ← priority 0, dwell/버킷 미사용
+```
+
+**수정**: `seen`(마운트된 전부 — 블록 GC·임베드용)과 `resolved`(이번 스윕에서 실제로 *처리*된 것만)를 분리하고, `State.previousSeen = resolved`로 바꿨다. 아무것도 하지 못한 스윕에서는 "새로 마운트됨" 자격이 다음 스윕까지 그대로 남는다.
+
+부수 버그 2건도 같이 고쳤다: (2) Alt+T로 다시 켰을 때 `reconcile()`을 즉시 호출하지 않아 1500ms 폴링 인터벌을 기다려야 했던 것(위젯의 `⏸ 꺼짐` → 클릭 재활성화 경로에서 특히 중요해짐), (3) `Viewport.attach`가 채널 전환마다 새 `IntersectionObserver`를 만들면서 이전 것을 `disconnect()`하지 않아, 낡은 관찰자의 뒤늦은 `onLeave` 콜백이 msgId 기준으로 방금 무장한 dwell 타이머를 취소해 버리던 문제(오브젝트·타이머 누수 겸).
+
+### 영구 번역 기록 (`History`, `dcxlt.history.v1`)
+
+TCache는 `msgId|hash|targetLang|model`로 키가 잡혀 있어 모델을 바꾸거나 LRU에서 밀리면 번역이 통째로 고아가 된다. `History`는 `id|hash`만으로 키를 잡아 모델/언어와 무관하게 살아남는 별도 저장소다. `Queue._commit`에서 커밋될 때마다(skip 제외) 함께 적재되고, `reconcile`/`reconcileEmbeds`/`Viewport.translateVisibleNow`가 TCache 미스 시 `historyRestore()`로 즉시 폴백 렌더한 뒤 현재 모델 키로 TCache를 다시 데운다 — 새로고침·모델 변경·캐시 축출 어느 쪽에서도 번역이 사라지지 않는 이유다.
+
+`ko`는 `{{n}}` 마커를 유지한 원형 그대로 저장한다(렌더용). `Extract.rehydrate`가 매칭 안 되는 `{{n}}` 토큰을 조용히 지워버리기 때문에, 마커와 짝을 이루는 `placeholders` 배열(`ph`, 항목당 최대 12개, `raw`는 400B 넘으면 버리고 `label`만 남김)을 같이 저장하지 않으면 복원된 번역에서 멘션·링크·이모지·코드가 전부 사라진다. `gv`/`gt`(용어집 rev·매칭 목록)도 원본 그대로 저장해 `historyRestore`가 `glossaryRecheck`를 예전과 동일하게 재현할 수 있게 했다 — 현재 rev를 찍어버리면 용어집 변경 재번역이 조용히 죽는다. 항목 수 2000 / 3MB 상한을 `flush()` 한 번의 O(n) 패스로 강제(TCache의 O(n²) 초과-바이트 while 루프보다 낫다), `pagehide`를 `beforeunload` 옆에 추가해 배치 flush 창이 열린 채 언로드되는 경로를 막았다.
+
+### 플로팅 위젯 + 번역 기록 오버레이
+
+우측 하단 알약 버튼(`#dcxlt-widget-host`, `▶ 번역`/배지/`☰`/`⚙`, 꺼짐일 때 `⏸ 꺼짐`)이 항상 떠서 화면의 메시지를 스크롤·dwell·백필 예산과 무관하게 즉시 번역한다. `reconcile`이 아니라 `setInterval(Widget.ensure, 2000)`으로 독립 유지되는 이유: `reconcile`은 `cfg.enabled=false`면 즉시 return하는데, 위젯은 바로 그 순간 `⏸ 꺼짐`을 보여줘야 한다. 클릭이 포커스를 뺏지 않도록 `tabindex="-1"` + `mousedown` `preventDefault`.
+
+`#dcxlt-history-host`(별도 shadow host, 설정 패널의 560px 모달과 분리 — 표 형태엔 내부 스크롤 영역이 필요하고 설정 호스트를 건드리면 시나리오 42가 검증하는 shadow 구조가 흔들린다)는 날짜→채널로 그룹핑된 기록을 검색/채널 필터/복사·이동·삭제/`.txt`·`.json` 내보내기(`Blob`+`<a download>`, 하네스가 스텁할 수 있도록 `_download()`로 분리)/2단계 `기록 지우기`(`window.confirm` 미사용 — 하네스·디스코드 이벤트 루프를 막기 때문)로 보여준다. 메뉴 **번역 기록**, 단축키 **Alt+H**, 위젯 **☰**로 연다.
+
+### 시나리오 43-46
+
+43(기록 적재·중복 교체·2000건 FIFO 상한), 44(캐시 비우기/모델 변경 후 기록 폴백 렌더로 즉시 복원, API 재호출 없음), 45(오버레이 열기/검색/채널 필터/내보내기/개별 삭제/2단계 전체 지우기, 캐시 비우기와 분리 확인), 46((A) 스크롤업 중 도착 → 하단 복귀 시 즉시 번역되는 Part1 회귀 확인, (B) 위젯 버튼으로 백필 제약 무시 즉시 번역, (C) 꺼짐 표시/재활성화, (D) `showWidget` 토글, (E) Alt+T 재활성화 즉시 reconcile). 하네스 46 시나리오, 47/47 PASS(네트워크 어서션 포함) 2회 연속.
+
 ## 진행 로그
 - 08-31 18:40 GitHub 공개 리포 생성·초기 스냅샷 푸시 (사용자 승인)
 - 08-31 19:10 구현 워커 1차 완료: 하네스 34 중 28 PASS → 헤드리스 재검증 지시
@@ -88,3 +123,4 @@ Codex/Opus 교차 검증: Codex는 "피크가 BATCH_MAX_ITEMS=8로 유계이니 
 - 09-01 (오전) _bisect 되병합 무한루프 재현(시나리오 39) → 세마포어+maxBatch 수정 → 헤드리스 40/40 → v0.2.1
 - 09-01 사용자: 양쪽 PC 설치 + API 키 입력 + 실번역 확인 완료 → 현재 상태 체크리스트 전부 완료
 - 09-01 (오후) 실사용 디버깅: 키 입력 전 로드된 탭 → 401 → enabled:false 영구화 확인 → 키 가드/자동 재활성화/연결 테스트/README 트러블슈팅 → 43/43 → v0.2.2
+- 09-01 (오후) "매번 새로고침해야 한다" 제보 → 계측 프로브로 `previousSeen` 영구 강등 버그 특정 → `seen`/`resolved` 분리 수정(pre-flight 43/43 회귀 없음 확인) → 영구 번역 기록(`History`)·폴백 렌더·플로팅 위젯·번역 기록 오버레이 구현 → 시나리오 43-46 추가 → 헤드리스 47/47 PASS 2회 연속 → v0.3.0

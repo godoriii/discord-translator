@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Inline Translator (KO)
 // @namespace    https://github.com/godoriii/discord-translator
-// @version      0.2.2
+// @version      0.3.0
 // @description  디스코드 웹 채팅을 사용자 용어집 기반으로 한국어 인라인 번역
 // @match        https://discord.com/*
 // @match        https://ptb.discord.com/*
@@ -31,7 +31,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '0.2.2';
+  var SCRIPT_VERSION = '0.3.0';
 
   // ===== 1. CONSTANTS =====
   var C = {
@@ -78,6 +78,18 @@
     VIEWPORT_DWELL_MS: 400,
     BACKFILL_PER_MIN: 40,
 
+    // ── 번역 기록 (v0.3.0) ──
+    HISTORY_MAX_ENTRIES: 2000,
+    HISTORY_MAX_BYTES: 3000000,
+    HISTORY_FLUSH_IDLE_MS: 5000,
+    // TCache보다 촘촘하게 flush한다: 기록의 존재 이유가 "새로고침해도
+    // 살아남는 것"이므로 배치 창이 길면 목적 자체가 깨진다.
+    HISTORY_FLUSH_EVERY_N: 25,
+    HISTORY_SRC_MAX: 2000,
+    HISTORY_PH_MAX: 12,
+    HISTORY_PH_RAW_MAX: 400,
+    WIDGET_TICK_MS: 500,
+
     SUFFIXES: ['', 's', 'es', "'s", '’s', "s'"],
 
     CACHE_MIN_TOKENS: {
@@ -104,6 +116,7 @@
     glossaryRemote: C.NS + '.glossary.remote.v1',
     glossaryLocal: C.NS + '.glossary.local.v1',
     tcache: C.NS + '.tcache.v1',
+    history: C.NS + '.history.v1',
     stats: C.NS + '.stats.v1',
     diag: C.NS + '.diag.v1'
   };
@@ -143,7 +156,10 @@
     showOriginal: true,
     hotkeyToggle: 'Alt+KeyT',
     hotkeyTranslateView: 'Alt+Shift+KeyT',
+    hotkeyHistory: 'Alt+KeyH',
     perChannelOff: [],
+
+    showWidget: true,
 
     fontScale: 0.875,
     debug: false,
@@ -172,6 +188,8 @@
       rejectedCount: 0
     },
     tcacheMap: new Map(),
+    historyMap: new Map(),
+    chNames: new Map(),
     stats: { day: '', reqs: 0, in: 0, out: 0, cw: 0, cr: 0, errors: 0 },
     diag: null,
     detect: { scroller: null, strategy: null, observer: null, onDirty: null },
@@ -290,6 +308,7 @@
       State.apiKey = Store.getApiKey();
       State.customApiKey = Store.get(StoreKeys.customApiKey, '') || '';
       TCache._load();
+      History._load();
       Store._loadStats();
       return cfg;
     },
@@ -412,6 +431,124 @@
     _scheduleIdleFlush: null // assigned after Util is ready, see below
   };
   TCache._scheduleIdleFlush = Util.debounce(function () { TCache.flush(); }, C.TCACHE_FLUSH_IDLE_MS);
+
+  // ===== 4b. History (영구 번역 기록, v0.3.0) =====
+  // TCache와 목적이 다르다. TCache 키는 msgId|hash|targetLang|model 이라
+  // 모델을 바꾸거나 LRU에서 밀리면 통째로 고아가 된다. History는
+  // id|hash 만으로 키를 잡아 모델/언어와 무관하게 살아남고, reconcile의
+  // 폴백 렌더가 여기서 번역을 되살린 뒤 현재 모델 키로 TCache를 다시
+  // 데운다 — 사용자가 새로고침·모델 변경 후에도 번역을 잃지 않는 이유.
+  var History = {
+    key: function (id, hash) { return id + '|' + hash; },
+
+    // Extract가 만든 placeholders(raw=outerHTML)는 그대로 저장하면
+    // 항목당 수 KB가 된다. rehydrate/cloneFromPh가 raw 파싱 실패 시
+    // label 텍스트 노드로 우아하게 폴백하므로(§6 cloneFromPh), 큰 raw는
+    // 버리고 label만 남긴다.
+    _packPh: function (list) {
+      var out = [];
+      (list || []).forEach(function (p, i) {
+        if (i >= C.HISTORY_PH_MAX) return;
+        var o = { t: p.type, l: String(p.label || '').slice(0, 120) };
+        var raw = String(p.raw || '');
+        if (raw && raw.length <= C.HISTORY_PH_RAW_MAX) o.r = raw;
+        out.push(o);
+      });
+      return out;
+    },
+    _unpackPh: function (list) {
+      return (list || []).map(function (p, i) {
+        return { i: i, type: p.t, raw: p.r || '', label: p.l || '' };
+      });
+    },
+    // {{n}} 마커를 label로 치환한 사람이 읽을 수 있는 평문.
+    // 오버레이 표시·검색·내보내기 전용 — 렌더에는 절대 쓰지 않는다.
+    flatten: function (text, ph) {
+      return String(text || '')
+        .replace(/\{\{(\d+)\}\}/g, function (m, n) {
+          var p = ph && ph[Number(n)];
+          return p ? (p.l || p.label || '') : '';
+        })
+        .replace(/LB/g, '{{').replace(/RB/g, '}}');
+    },
+    // 스노플레이크 → ms. 실 스노플레이크 범위에서 Number 나눗셈 오차는
+    // 1e-4ms 미만이라 BigInt가 필요 없다(검증: 175928847299117063 →
+    // 1462015105796, 시프트/나눗셈 일치).
+    timeOf: function (msgId) {
+      var base = String(msgId).replace(/-embed-\d+$/, '');
+      var n = Number(base);
+      if (!isFinite(n) || n <= 0) return 0;
+      return Math.floor(n / 4194304) + 1420070400000;
+    },
+
+    append: function (entry) {
+      if (!entry || !entry.id || !entry.h) return;
+      State.historyMap.set(History.key(entry.id, entry.h), entry);
+      History._dirty = true;
+      History._writeCount = (History._writeCount || 0) + 1;
+      if (History._writeCount >= C.HISTORY_FLUSH_EVERY_N) History.flush();
+      else History._scheduleIdleFlush();
+    },
+    get: function (id, hash) { return State.historyMap.get(History.key(id, hash)) || null; },
+    remove: function (id, hash) {
+      var ok = State.historyMap.delete(History.key(id, hash));
+      if (ok) { History._dirty = true; History.flush(true); }
+      return ok;
+    },
+    // 최신 우선 (tt 내림차순)
+    all: function () {
+      var arr = [];
+      State.historyMap.forEach(function (v) { arr.push(v); });
+      arr.sort(function (a, b) { return (b.tt || 0) - (a.tt || 0); });
+      return arr;
+    },
+    channels: function () {
+      var seen = {}, out = [];
+      State.historyMap.forEach(function (v) {
+        if (v.ch && !seen[v.ch]) { seen[v.ch] = 1; out.push({ id: v.ch, name: v.cn || '' }); }
+      });
+      out.sort(function (a, b) { return (a.name || a.id).localeCompare(b.name || b.id); });
+      return out;
+    },
+    clear: function () { State.historyMap.clear(); History._dirty = true; History.flush(true); },
+
+    // 항목 수 상한(오래된 tt부터) + 바이트 상한을 한 번의 O(n) 패스로
+    // 처리한다. TCache.flush는 초과 시 while 루프 안에서 매번 전체를
+    // JSON.stringify 하는 O(n^2)인데, 2000항목에서는 그 비용이 실측
+    // 가능할 만큼 커진다.
+    flush: function (force) {
+      if (!History._dirty && !force) return;
+      var arr = [];
+      State.historyMap.forEach(function (v, k) { arr.push([k, v]); });
+      arr.sort(function (a, b) { return (a[1].tt || 0) - (b[1].tt || 0); }); // 오래된 것 먼저
+      if (arr.length > C.HISTORY_MAX_ENTRIES) arr = arr.slice(arr.length - C.HISTORY_MAX_ENTRIES);
+
+      var items = {}, total = 2, kept = {};
+      for (var i = arr.length - 1; i >= 0; i--) {   // 최신부터 담는다
+        var k = arr[i][0], v = arr[i][1];
+        var cost = JSON.stringify(k).length + JSON.stringify(v).length + 2;
+        if (total + cost > C.HISTORY_MAX_BYTES) break;
+        total += cost; items[k] = v; kept[k] = 1;
+      }
+      // 메모리와 저장소가 어긋나지 않도록 잘려나간 항목은 맵에서도 제거
+      var drop = [];
+      State.historyMap.forEach(function (v, k) { if (!kept[k]) drop.push(k); });
+      drop.forEach(function (k) { State.historyMap.delete(k); });
+
+      Store.set(StoreKeys.history, { v: 1, items: items });
+      History._dirty = false;
+      History._writeCount = 0;
+    },
+    _load: function () {
+      var stored = Store.get(StoreKeys.history, { v: 1, items: {} });
+      var items = (stored && stored.items) || {};
+      State.historyMap = new Map(Object.keys(items).map(function (k) { return [k, items[k]]; }));
+    },
+    _dirty: false,
+    _writeCount: 0,
+    _scheduleIdleFlush: null
+  };
+  History._scheduleIdleFlush = Util.debounce(function () { History.flush(); }, C.HISTORY_FLUSH_IDLE_MS);
 
   // ===== 5. Glossary =====
   function normalizeApostrophes(s) { return String(s || '').replace(/[‘’]/g, "'"); }
@@ -932,6 +1069,27 @@
         if (rm && rm[1]) return rm[1];
       }
       return null;
+    },
+    guildId: function () {
+      var m = location.pathname.match(/\/channels\/(@me|\d+)\//);
+      if (!m) return '';
+      return m[1] === '@me' ? '' : m[1];
+    },
+    // 커밋마다 DOM 질의를 반복하지 않도록 채널별로 1회만 캐시한다.
+    // 표시용(장식)이라 실패하면 조용히 ''로 떨어진다 — 오버레이는
+    // 이름이 없으면 채널 id를 그대로 보여준다.
+    channelName: function (ch) {
+      if (!ch) return '';
+      if (State.chNames.has(ch)) return State.chNames.get(ch);
+      var name = '';
+      try {
+        var el = document.querySelector(
+          'section[class*="title_"] h1, [class*="chatContent"] h1, h1[class*="title"]'
+        );
+        if (el && el.textContent) name = el.textContent.trim().slice(0, 60);
+      } catch (e) { /* noop */ }
+      State.chNames.set(ch, name);
+      return name;
     },
     startObserving: function (onDirty) {
       var target = State.detect.scroller || document.body;
@@ -1950,6 +2108,12 @@
   var Viewport = {
     attach: function (scroller) {
       if (typeof IntersectionObserver === 'undefined') return;
+      // 채널 전환마다 새 IO를 만들면서 이전 것을 끊지 않으면, 떨어져
+      // 나간 노드에 대한 낡은 onLeave 콜백이 뒤늦게 도착해 방금 무장한
+      // dwell 타이머를 msgId 기준으로 취소해 버린다(같은 채널 재방문 시).
+      if (State.viewport.io) { try { State.viewport.io.disconnect(); } catch (e) { /* noop */ } }
+      State.viewport.timers.forEach(function (t) { clearTimeout(t); });
+      State.viewport.timers.clear();
       try {
         State.viewport.io = new IntersectionObserver(function (entries) {
           entries.forEach(function (en) { en.isIntersecting ? Viewport.onEnter(en.target) : Viewport.onLeave(en.target); });
@@ -1977,6 +2141,17 @@
       bucket.count++;
       return true;
     },
+    // 위젯의 "▶ 번역" 전용. 마운트된 메시지를 즉시 dwelled로 승격하고
+    // 백필 예산 창을 새로 연다 — 버튼 직후의 reconcile 스윕이 400ms
+    // dwell / 40-per-min 예산에 다시 걸려 아무것도 못 하는 일을 막는다.
+    markVisibleDwelled: function () {
+      var mounted = Detect.listMounted();
+      mounted.contentNodes.forEach(function (node) {
+        var id = Detect.msgIdOf(node);
+        if (id) State.viewport.dwelled.add(id);
+      });
+      State.viewport.bucket = { count: 0, windowStart: Util.now() };
+    },
     translateVisibleNow: function () {
       if (!Api.configured()) { UI.promptForKey(); return; }
       var mounted = Detect.listMounted();
@@ -1990,6 +2165,7 @@
         if (sk.skip) return;
         var hit = TCache.get(TCache.key(msgId, item.hash));
         if (hit) { Render.upsert(node, msgId, 'done', Object.assign({}, hit, { hash: item.hash })); return; }
+        if (historyRestore(node, msgId, item, ch)) return;
         item.channelId = ch;
         Render.upsert(node, msgId, 'loading', { hash: item.hash });
         Queue.enqueue(item, 2);
@@ -2053,6 +2229,7 @@
       GM.registerMenuCommand('설정 열기', function () { UI.openSettings('일반'); });
       GM.registerMenuCommand('용어집 새로고침', function () { Glossary.fetchRemote(true); });
       GM.registerMenuCommand('캐시 비우기', function () { TCache.clear(); });
+      GM.registerMenuCommand('번역 기록', function () { HistoryUI.open(); });
       GM.registerMenuCommand('진단 복사', function () {
         var text = Detect.reportDiagnostics();
         if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text);
@@ -2083,9 +2260,16 @@
           Store.saveSettings(togglePatch);
           Render.setGlobalHidden(!cfg.enabled);
           Render.statusChip(cfg.enabled ? '번역 켜짐' : '번역 꺼짐', 'info');
+          // 다시 켰을 때 1500ms 폴링 인터벌을 기다리지 않는다
+          // (설정 패널 저장 경로는 이미 reconcile()을 부른다).
+          if (cfg.enabled) reconcile();
+          Widget.refresh();
         } else if (combo === cfg.hotkeyTranslateView) {
           e.preventDefault();
           Viewport.translateVisibleNow();
+        } else if (combo === cfg.hotkeyHistory) {
+          e.preventDefault();
+          HistoryUI.open();
         }
       });
     },
@@ -2197,6 +2381,7 @@
         '<label><input type="checkbox" data-f="autoTranslate"> 자동번역</label>' +
         '<label><input type="checkbox" data-f="translateEmbeds"> 임베드 번역</label>' +
         '<label><input type="checkbox" data-f="showOriginal"> 원문 표시</label>' +
+        '<label><input type="checkbox" data-f="showWidget"> 번역 버튼(플로팅 위젯) 표시</label>' +
         '<label>토글 단축키</label><input type="text" data-f="hotkeyToggle">' +
         '<button data-act="save-general">저장</button>' +
         '</div>' +
@@ -2271,11 +2456,13 @@
           autoTranslate: shadow.querySelector('[data-f="autoTranslate"]').checked,
           translateEmbeds: shadow.querySelector('[data-f="translateEmbeds"]').checked,
           showOriginal: shadow.querySelector('[data-f="showOriginal"]').checked,
+          showWidget: shadow.querySelector('[data-f="showWidget"]').checked,
           hotkeyToggle: shadow.querySelector('[data-f="hotkeyToggle"]').value
         };
         if (patch.enabled) patch.disabledReason = ''; // B.3: checkbox-enable also clears an auth auto-disable
         Store.saveSettings(patch);
         Render.setGlobalHidden(!cfg.enabled);
+        Widget.apply();
         UI._refreshCacheWarn(shadow);
         UI.refreshKeyHints(shadow);
         State.keyPromptShown = false;
@@ -2341,6 +2528,7 @@
       shadow.querySelector('[data-f="autoTranslate"]').checked = cfg.autoTranslate;
       shadow.querySelector('[data-f="translateEmbeds"]').checked = cfg.translateEmbeds;
       shadow.querySelector('[data-f="showOriginal"]').checked = cfg.showOriginal;
+      shadow.querySelector('[data-f="showWidget"]').checked = cfg.showWidget !== false;
       shadow.querySelector('[data-f="hotkeyToggle"]').value = cfg.hotkeyToggle;
       shadow.querySelector('[data-f="glossaryUrl"]').value = cfg.glossaryUrl;
       UI._refreshCacheWarn(shadow);
@@ -2435,6 +2623,368 @@
     }
   };
 
+  // ===== 13b. Floating widget (v0.3.0) =====
+  // shadow DOM 격리 + document.body 부착. 디스코드가 리렌더로 날려도
+  // ensure()가 2초마다 되살린다. reconcile에 얹지 않는 이유: reconcile은
+  // cfg.enabled=false면 즉시 return 하는데, 위젯은 바로 그때 '⏸ 꺼짐'을
+  // 보여줘야 한다.
+  var Widget = {
+    _host: null, _shadow: null, _timer: null,
+    apply: function () {
+      if (cfg && cfg.showWidget === false) { Widget.unmount(); return; }
+      Widget.ensure();
+    },
+    ensure: function () {
+      if (cfg && cfg.showWidget === false) return;
+      if (!Widget._host || !Widget._host.isConnected) Widget.mount();
+      else Widget.refresh();
+    },
+    unmount: function () {
+      if (Widget._timer) { clearInterval(Widget._timer); Widget._timer = null; }
+      if (Widget._host && Widget._host.parentNode) Widget._host.parentNode.removeChild(Widget._host);
+      Widget._host = null; Widget._shadow = null;
+    },
+    mount: function () {
+      var host = document.createElement('div');
+      host.id = 'dcxlt-widget-host';
+      host.style.cssText = 'position:fixed;right:16px;bottom:96px;z-index:2147483000';
+      document.body.appendChild(host);
+      var sh = host.attachShadow({ mode: 'open' });
+      sh.innerHTML =
+        '<style>' +
+        ':host{all:initial}' +
+        '.pill{display:flex;align-items:center;gap:6px;background:#1e1f22;color:#dbdee1;' +
+          'border:1px solid #3f4147;border-radius:20px;padding:5px 8px;font:13px/1 sans-serif;' +
+          'box-shadow:0 4px 14px rgba(0,0,0,.45)}' +
+        'button{all:unset;cursor:pointer;padding:4px 8px;border-radius:14px;color:inherit;' +
+          'display:inline-flex;align-items:center;gap:5px}' +
+        'button:hover{background:#35373c}' +
+        '.go[data-tone="busy"]{background:#5865f2;color:#fff}' +
+        '.go[data-tone="off"]{background:#4e5058;color:#b5bac1}' +
+        '.badge{min-width:16px;text-align:center;background:#5865f2;color:#fff;border-radius:9px;' +
+          'padding:1px 6px;font-size:11px}' +
+        '.ic{font-size:14px;opacity:.8}.ic:hover{opacity:1}' +
+        '</style>' +
+        '<div class="pill">' +
+          '<button class="go" data-act="go" tabindex="-1"><span class="lbl">▶ 번역</span></button>' +
+          '<span class="badge" hidden>0</span>' +
+          '<button class="ic" data-act="hist" tabindex="-1" title="번역 기록 (Alt+H)">☰</button>' +
+          '<button class="ic" data-act="cfg" tabindex="-1" title="설정">⚙</button>' +
+        '</div>';
+      // 포커스 강탈 금지: 채팅 입력창에 타이핑하던 중 눌러도 커서를
+      // 잃지 않아야 한다. tabindex=-1 만으로는 클릭 포커스를 못 막는다.
+      sh.addEventListener('mousedown', function (e) { e.preventDefault(); });
+      sh.querySelector('[data-act="go"]').addEventListener('click', Widget.onGo);
+      sh.querySelector('[data-act="hist"]').addEventListener('click', function () { HistoryUI.open(); });
+      sh.querySelector('[data-act="cfg"]').addEventListener('click', function () { UI.openSettings('일반'); });
+      Widget._host = host; Widget._shadow = sh;
+      if (Widget._timer) clearInterval(Widget._timer);
+      Widget._timer = setInterval(Widget.refresh, C.WIDGET_TICK_MS);
+      Widget.refresh();
+    },
+    onGo: function () {
+      if (!cfg.enabled) {
+        Store.saveSettings({ enabled: true, disabledReason: '' });
+        Render.setGlobalHidden(false);
+        Render.statusChip('번역 켜짐', 'info');
+        reconcile();
+        Widget.refresh();
+        return;
+      }
+      Viewport.reevaluate();
+      Viewport.markVisibleDwelled();
+      var before = Queue.stats().pending + State.queue.inflightCount;
+      Viewport.translateVisibleNow();
+      reconcile();
+      var added = (Queue.stats().pending + State.queue.inflightCount) - before;
+      Render.statusChip(added > 0 ? (added + '개 번역 시작') : '번역할 새 메시지 없음', 'info');
+      Widget.refresh();
+    },
+    refresh: function () {
+      var sh = Widget._shadow;
+      if (!sh || !Widget._host || !Widget._host.isConnected) return;
+      var go = sh.querySelector('.go'), lbl = sh.querySelector('.lbl'), badge = sh.querySelector('.badge');
+      if (!cfg.enabled) {
+        lbl.textContent = '⏸ 꺼짐';
+        go.setAttribute('data-tone', 'off');
+        badge.hidden = true;
+        return;
+      }
+      var s = Queue.stats();
+      var n = s.pending + s.inflight;
+      lbl.textContent = '▶ 번역';
+      go.setAttribute('data-tone', n > 0 ? 'busy' : 'idle');
+      badge.hidden = n === 0;
+      badge.textContent = String(n);
+    }
+  };
+
+  // ===== 13c. 번역 기록 오버레이 (v0.3.0) =====
+  // 설정 패널(560px 모달, 탭 문자열 병렬 목록)에 얹지 않고 독립 호스트를
+  // 쓴다: 표 형태에는 내부 스크롤 영역이 필요하고, 설정 호스트를 건드리면
+  // 시나리오 42가 검증하는 shadow 구조가 흔들린다.
+  var HistoryUI = {
+    _root: null, _shadow: null, _filter: { q: '', ch: '' }, _confirmClear: false,
+
+    open: function () {
+      if (!HistoryUI._root || !HistoryUI._root.isConnected) HistoryUI._build();
+      HistoryUI._root.hidden = false;
+      HistoryUI._confirmClear = false;
+      HistoryUI.render();
+    },
+    close: function () { if (HistoryUI._root) HistoryUI._root.hidden = true; },
+
+    _build: function () {
+      var host = document.createElement('div');
+      host.id = 'dcxlt-history-host';
+      host.style.cssText = 'position:fixed;inset:0;z-index:2147483646';
+      document.body.appendChild(host);
+      // 설정 패널과 동일한 키 삼키기(§13 _buildPanel 주석): 그림자 DOM 안의
+      // 검색창은 document 레벨에서 편집 요소로 보이지 않아, 막지 않으면
+      // 디스코드가 타이핑을 채팅 입력창으로 가로채고 Alt+T까지 발동한다.
+      ['keydown', 'keyup', 'keypress', 'input', 'paste', 'cut', 'copy',
+        'compositionstart', 'compositionupdate', 'compositionend'].forEach(function (t) {
+        host.addEventListener(t, function (e) { e.stopPropagation(); });
+      });
+      host.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') { e.preventDefault(); HistoryUI.close(); }
+      });
+      var sh = host.attachShadow({ mode: 'open' });
+      sh.innerHTML = '<style>' + HistoryUI._css() + '</style>' + HistoryUI._html();
+      HistoryUI._root = host; HistoryUI._shadow = sh;
+      HistoryUI._bind(sh);
+    },
+
+    _css: function () {
+      return '.overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;' +
+          'align-items:center;justify-content:center;font-family:sans-serif;color:#dcddde}' +
+        '.modal{background:#2b2d31;border-radius:8px;width:900px;max-width:95vw;max-height:86vh;' +
+          'display:flex;flex-direction:column;padding:16px;position:relative}' +
+        '.close{position:absolute;top:10px;right:14px;background:transparent;border:none;' +
+          'color:#dcddde;font-size:16px;cursor:pointer}' +
+        'h2{margin:0 0 10px;font-size:15px}' +
+        '.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}' +
+        'input[type=text],select{background:#1e1f22;color:#fff;border:1px solid #444;' +
+          'border-radius:4px;padding:6px}' +
+        'input[type=text]{flex:1;min-width:180px}' +
+        'button{background:#5865f2;color:#fff;border:none;border-radius:4px;padding:6px 10px;cursor:pointer}' +
+        'button.ghost{background:#4e5058}button.danger{background:#8a1f22}' +
+        '.count{font-size:12px;color:#949ba4;margin-left:auto}' +
+        '.list{overflow:auto;max-height:70vh;border-top:1px solid #444}' +
+        '.day{position:sticky;top:0;background:#2b2d31;padding:8px 0 4px;font-size:12px;' +
+          'color:#f2f3f5;font-weight:bold}' +
+        '.chan{padding:4px 0;font-size:11px;color:#949ba4}' +
+        '.row{display:grid;grid-template-columns:56px 110px 1fr 1fr auto;gap:8px;padding:6px 0;' +
+          'border-bottom:1px solid #3a3c41;font-size:12px;align-items:start}' +
+        '.tm{color:#949ba4}.au{color:#b5bac1;overflow:hidden;text-overflow:ellipsis}' +
+        '.src,.ko{white-space:pre-wrap;word-break:break-word;overflow:hidden;' +
+          'display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;cursor:pointer}' +
+        '.src{color:#949ba4}.ko{color:#dcddde}' +
+        '.src.open,.ko.open{-webkit-line-clamp:unset;display:block}' +
+        '.acts{display:flex;gap:4px}.acts button{padding:2px 6px;font-size:11px}' +
+        '.empty{padding:24px;text-align:center;color:#949ba4;font-size:12px}';
+    },
+
+    _html: function () {
+      return '<div class="overlay"><div class="modal">' +
+        '<button class="close" data-act="close">✕</button>' +
+        '<h2>번역 기록</h2>' +
+        '<div class="bar">' +
+          '<input type="text" data-el="q" placeholder="원문 / 번역 검색">' +
+          '<select data-el="chsel"><option value="">모든 채널</option></select>' +
+          '<button class="ghost" data-act="export-txt">내보내기 .txt</button>' +
+          '<button class="ghost" data-act="export-json">내보내기 .json</button>' +
+          '<button class="danger" data-act="clear">기록 지우기</button>' +
+          '<span class="count" data-el="count"></span>' +
+        '</div>' +
+        '<div class="list" data-el="list"></div>' +
+      '</div></div>';
+    },
+
+    _bind: function (sh) {
+      sh.querySelector('[data-act="close"]').addEventListener('click', HistoryUI.close);
+      sh.querySelector('.overlay').addEventListener('click', function (e) {
+        if (e.target && e.target.classList.contains('overlay')) HistoryUI.close();
+      });
+      var onQ = Util.debounce(function () {
+        HistoryUI._filter.q = sh.querySelector('[data-el="q"]').value.trim().toLowerCase();
+        HistoryUI.render();
+      }, 150);
+      sh.querySelector('[data-el="q"]').addEventListener('input', onQ);
+      sh.querySelector('[data-el="chsel"]').addEventListener('change', function (e) {
+        HistoryUI._filter.ch = e.target.value; HistoryUI.render();
+      });
+      sh.querySelector('[data-act="export-txt"]').addEventListener('click', function () {
+        HistoryUI._download('dcxlt-history.txt', HistoryUI._asText(HistoryUI._rows()), 'text/plain');
+      });
+      sh.querySelector('[data-act="export-json"]').addEventListener('click', function () {
+        HistoryUI._download('dcxlt-history.json',
+          JSON.stringify(HistoryUI._rows(), null, 1), 'application/json');
+      });
+      // window.confirm은 자동화·디스코드 이벤트 루프를 모두 막으므로
+      // 버튼 자체를 2단계로 만든다.
+      sh.querySelector('[data-act="clear"]').addEventListener('click', function (e) {
+        if (!HistoryUI._confirmClear) {
+          HistoryUI._confirmClear = true;
+          e.target.textContent = '정말 지울까요?';
+          setTimeout(function () {
+            if (!HistoryUI._confirmClear) return;
+            HistoryUI._confirmClear = false;
+            try { e.target.textContent = '기록 지우기'; } catch (x) { /* noop */ }
+          }, 4000);
+          return;
+        }
+        HistoryUI._confirmClear = false;
+        e.target.textContent = '기록 지우기';
+        History.clear();
+        HistoryUI.render();
+      });
+    },
+
+    _rows: function () {
+      var f = HistoryUI._filter;
+      return History.all().filter(function (e) {
+        if (f.ch && e.ch !== f.ch) return false;
+        if (!f.q) return true;
+        if (!e._s) e._s = ((e.src || '') + '\n' + History.flatten(e.ko, e.ph) + '\n' + (e.au || '')).toLowerCase();
+        return e._s.indexOf(f.q) !== -1;
+      });
+    },
+
+    _asText: function (rows) {
+      return rows.map(function (e) {
+        var d = new Date(e.mt || e.tt);
+        return '[' + d.toLocaleString('ko-KR') + '] #' + (e.cn || e.ch) + ' ' + (e.au || '') + '\n' +
+          '  원문: ' + (e.src || '') + '\n' +
+          '  번역: ' + History.flatten(e.ko, e.ph);
+      }).join('\n\n');
+    },
+
+    // 별도 메서드로 뺀 이유: 하네스가 이것만 스텁해서 실제 다운로드를
+    // 발생시키지 않고 내보내기 내용을 검증할 수 있게 하려는 것.
+    _download: function (filename, text, mime) {
+      try {
+        var blob = new Blob([text], { type: mime + ';charset=utf-8' });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+        Render.toast('내보냄: ' + filename);
+      } catch (err) {
+        // 다운로드가 막히면 클립보드로 폴백 (진단 복사와 같은 패턴)
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text);
+          Render.toast('다운로드가 막혀 클립보드에 복사했습니다.');
+        } catch (e2) { Render.toast('내보내기 실패'); }
+      }
+    },
+
+    _navigate: function (e) {
+      var base = String(e.id).replace(/-embed-\d+$/, '');
+      var url = '/channels/' + (e.g || '@me') + '/' + e.ch + '/' + base;
+      HistoryUI.close();
+      if (Router.currentChannel() === e.ch) {
+        var el = document.getElementById('message-content-' + base);
+        if (el && el.scrollIntoView) { try { el.scrollIntoView({ block: 'center' }); } catch (x) { /* noop */ } }
+        try { history.pushState({}, '', url); } catch (x2) { /* noop */ }
+        return;
+      }
+      // Router.start가 pushState를 후킹해 두어 우리 쪽(probe/reconcile)은
+      // 항상 반응한다. 디스코드 자체 SPA 라우터가 합성 popstate를 받아주는지는
+      // 로그인 세션 없이 검증 불가 — 그래서 800ms 뒤 실제로 이동했는지
+      // 확인하고, 아니면 진짜 내비게이션으로 떨어진다(기록 덕에 새로고침해도
+      // 번역은 살아남는다).
+      try {
+        history.pushState({}, '', url);
+        window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+      } catch (x3) { location.assign(url); return; }
+      setTimeout(function () {
+        if (!document.getElementById('message-content-' + base) && Router.currentChannel() !== e.ch) {
+          location.assign(url);
+        }
+      }, 800);
+    },
+
+    render: function () {
+      var sh = HistoryUI._shadow;
+      if (!sh) return;
+      var rows = HistoryUI._rows();
+      var total = State.historyMap.size;
+      sh.querySelector('[data-el="count"]').textContent = rows.length + ' / ' + total + '건';
+
+      var sel = sh.querySelector('[data-el="chsel"]');
+      var cur = sel.value;
+      var opts = ['<option value="">모든 채널</option>'];
+      History.channels().forEach(function (c) {
+        opts.push('<option value="' + Util.escapeHtml(c.id) + '">' +
+          Util.escapeHtml(c.name ? ('#' + c.name) : c.id) + '</option>');
+      });
+      sel.innerHTML = opts.join('');
+      sel.value = cur;
+
+      var list = sh.querySelector('[data-el="list"]');
+      list.textContent = '';
+      if (!rows.length) {
+        var em = document.createElement('div');
+        em.className = 'empty';
+        em.textContent = total ? '조건에 맞는 기록이 없습니다.' : '아직 기록이 없습니다.';
+        list.appendChild(em);
+        return;
+      }
+      var lastDay = '', lastCh = '';
+      rows.forEach(function (e) {
+        var d = new Date(e.mt || e.tt);
+        var day = d.toLocaleDateString('ko-KR');
+        if (day !== lastDay) {
+          lastDay = day; lastCh = '';
+          var dh = document.createElement('div'); dh.className = 'day'; dh.textContent = day;
+          list.appendChild(dh);
+        }
+        if (e.ch !== lastCh) {
+          lastCh = e.ch;
+          var chh = document.createElement('div'); chh.className = 'chan';
+          chh.textContent = e.cn ? ('#' + e.cn) : ('채널 ' + e.ch);
+          list.appendChild(chh);
+        }
+        var row = document.createElement('div');
+        row.className = 'row';
+        row.setAttribute('data-h-row', History.key(e.id, e.h));
+        var koFlat = History.flatten(e.ko, e.ph);
+
+        var tm = document.createElement('div'); tm.className = 'tm';
+        tm.textContent = d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+        var au = document.createElement('div'); au.className = 'au'; au.textContent = e.au || '';
+        var src = document.createElement('div'); src.className = 'src'; src.textContent = e.src || '';
+        var ko = document.createElement('div'); ko.className = 'ko'; ko.textContent = koFlat;
+        src.addEventListener('click', function () { src.classList.toggle('open'); });
+        ko.addEventListener('click', function () { ko.classList.toggle('open'); });
+
+        var acts = document.createElement('div'); acts.className = 'acts';
+        [['copy', '복사'], ['go', '이동'], ['del', '삭제']].forEach(function (p) {
+          var b = document.createElement('button');
+          b.className = p[0] === 'del' ? 'danger' : 'ghost';
+          b.setAttribute('data-act', p[0]);
+          b.textContent = p[1];
+          acts.appendChild(b);
+        });
+        acts.querySelector('[data-act="copy"]').addEventListener('click', function () {
+          if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(koFlat);
+          Render.toast('번역 복사됨');
+        });
+        acts.querySelector('[data-act="go"]').addEventListener('click', function () { HistoryUI._navigate(e); });
+        acts.querySelector('[data-act="del"]').addEventListener('click', function () {
+          History.remove(e.id, e.h); HistoryUI.render();
+        });
+
+        [tm, au, src, ko, acts].forEach(function (n) { row.appendChild(n); });
+        list.appendChild(row);
+      });
+    }
+  };
+
   // ===== 14. Reconcile core loop =====
   // Glossary-rev conditional re-translation (§3.1): when the glossary rev
   // moved, re-translate ONLY if this message's matched-term SET changed;
@@ -2453,6 +3003,30 @@
       hit.gv = Glossary.rev();
       TCache.set(key, hit);
     }
+  }
+
+  // 기록 폴백 렌더. TCache 미스일 때 영구 기록에서 번역을 되살리고,
+  // 현재 모델 키로 TCache를 다시 데운다. 되살린 항목은 원래 gv/gt를 그대로
+  // 옮겨 심어 glossaryRecheck가 이전과 똑같이 동작하게 한다 — 현재 rev를
+  // 찍어버리면 용어집 변경 재번역이 조용히 죽는다.
+  // 반환: 되살렸으면 true.
+  function historyRestore(anchorNode, msgId, item, ch) {
+    var he = History.get(msgId, item.hash);
+    if (!he) return false;
+    var placeholders = History._unpackPh(he.ph);
+    var warm = {
+      ko: he.ko, src: he.src, skip: false,
+      gv: he.gv || '', kind: he.k || item.kind,
+      mt: he.gt || [],
+      placeholders: placeholders,
+      hasSpoiler: !!he.hs,
+      audit: []
+    };
+    var key = TCache.key(msgId, item.hash);
+    TCache.set(key, warm);
+    Render.upsert(anchorNode, msgId, 'done', Object.assign({}, warm, { hash: item.hash }));
+    glossaryRecheck(item, ch, key, TCache.get(key));
+    return true;
   }
 
   function decidePriority(item, isNewlyMounted, ch) {
@@ -2487,6 +3061,7 @@
         var hit = TCache.get(key);
         if (hit) { Render.upsert(anchorEl, item.msgId, 'done', Object.assign({}, hit, { hash: item.hash })); return; }
         if (Queue.has(item.msgId, item.hash)) return;
+        if (historyRestore(anchorEl, item.msgId, item, ch)) return;
         Render.upsert(anchorEl, item.msgId, 'loading', { hash: item.hash });
         item.channelId = ch;
         Queue.enqueue(item, 1);
@@ -2500,6 +3075,12 @@
     var ch = Router.currentChannel();
     var mounted = Detect.listMounted();
     var seen = new Set();
+    // `seen`은 "지금 마운트된 전부"(블록 GC·임베드용).
+    // `resolved`는 "이번 스윕에서 실제로 처리된 것"만 담는다.
+    // previousSeen에 resolved만 넘겨야 decidePriority가 아무것도
+    // 하지 못한 스윕에서 "방금 마운트됨" 자격을 태우지 않는다
+    // (스크롤업 중 도착한 메시지가 영구히 백필로 강등되던 버그).
+    var resolved = new Set();
 
     mounted.contentNodes.forEach(function (node) {
       var msgId = Detect.msgIdOf(node);
@@ -2519,6 +3100,7 @@
 
       if (existing && existing.dataset.dcxltHash === item.hash) {
         if (existing.dataset.state === 'error') {
+          resolved.add(msgId);
           // A failed message keeps its error block until the user clicks
           // retry (§9-17). Auto-requeueing here would erase the FAILED
           // state milliseconds after _markFailed set it and retry the same
@@ -2530,6 +3112,7 @@
           // Same content already rendered — but a glossary rev change must
           // still be honored here: this is the only moment a mounted,
           // already-done message can schedule its conditional re-translation.
+          resolved.add(msgId);
           var doneKey = TCache.key(msgId, item.hash);
           var doneHit = TCache.get(doneKey);
           if (doneHit) glossaryRecheck(item, ch, doneKey, doneHit);
@@ -2539,6 +3122,7 @@
 
       var sk = Extract.shouldSkip(item);
       if (sk.skip) {
+        resolved.add(msgId);
         Render.remove(msgId);
         node.setAttribute('data-dcxlt-skip', sk.reason);
         return;
@@ -2548,18 +3132,23 @@
       var key = TCache.key(msgId, item.hash);
       var hit = TCache.get(key);
       if (hit) {
+        resolved.add(msgId);
         Render.upsert(node, msgId, 'done', Object.assign({}, hit, { hash: item.hash }));
         glossaryRecheck(item, ch, key, hit);
         return;
       }
 
-      if (Queue.has(msgId, item.hash)) return;
+      if (Queue.has(msgId, item.hash)) { resolved.add(msgId); return; }
+      // 캐시 미스 → 영구 기록에서 복원 시도. 모델 변경/LRU 축출/
+      // 새로고침으로 TCache가 비어도 여기서 즉시 되살아난다.
+      if (historyRestore(node, msgId, item, ch)) { resolved.add(msgId); return; }
       if (existing && existing.dataset.dcxltHash !== item.hash) {
         Render.upsert(node, msgId, 'loading', { hash: item.hash });
       }
 
       var priority = decidePriority(item, isNew, ch);
       if (priority !== null) {
+        resolved.add(msgId);
         Render.upsert(node, msgId, 'loading', { hash: item.hash });
         item.channelId = ch;
         Queue.enqueue(item, priority);
@@ -2573,7 +3162,7 @@
 
     if (cfg.translateEmbeds) reconcileEmbeds(mounted.accNodes, seen, ch);
 
-    State.previousSeen = seen;
+    State.previousSeen = resolved;
   }
 
   // ===== 15. Commit (used by Queue.onResponse) =====
@@ -2587,6 +3176,31 @@
       audit: cfg.glossaryAudit ? Glossary.audit(item.text, tr.ko, item.matches) : []
     };
     TCache.set(TCache.key(item.msgId, item.hash), entry);
+
+    // 영구 기록. skip 항목은 남기지 않는다(번역 결과가 없음).
+    if (!entry.skip) {
+      var ph = History._packPh(item.placeholders);
+      var ch = item.channelId || Router.currentChannel() || '';
+      History.append({
+        id: item.msgId,
+        ch: ch,
+        cn: Detect.channelName(ch),
+        g: Detect.guildId(),
+        au: item.author || '',
+        src: History.flatten(item.text, ph).slice(0, C.HISTORY_SRC_MAX),
+        ko: entry.ko,              // {{n}} 마커 유지 — 폴백 렌더가 rehydrate 한다
+        ph: ph,
+        gt: entry.mt,              // 용어집 매칭 목록 (TCache의 mt)
+        gv: entry.gv,
+        hs: !!entry.hasSpoiler,
+        k: entry.kind,
+        mt: History.timeOf(item.msgId),   // 메시지 시각 (스노플레이크)
+        tt: entry.ts,                     // 번역 시각
+        m: cfg.model,
+        h: item.hash
+      });
+    }
+
     var node = item.kind === 'embed'
       ? (item.anchorEl || document.getElementById('message-accessories-' + item.msgId.split('-embed-')[0]))
       : document.getElementById('message-content-' + item.msgId);
@@ -2621,6 +3235,8 @@
         setInterval(reconcile, C.RECONCILE_IDLE_MS);
         reconcile();
         setInterval(Queue.tick, 100);
+        Widget.apply();
+        setInterval(Widget.ensure, 2000);
         // Tab-resume catch-up: when the user comes back from another tab (or
         // this window regains OS focus), timers that were throttled while
         // hidden (setInterval(reconcile,...), setInterval(Queue.tick,...),
@@ -2635,22 +3251,29 @@
           Viewport.reevaluate();
         }, 500);
         document.addEventListener('visibilitychange', function () {
-          if (document.hidden) TCache.flush(true);
+          if (document.hidden) { TCache.flush(true); History.flush(true); }
           else onTabResume();
         });
         window.addEventListener('focus', onTabResume);
-        window.addEventListener('beforeunload', function () { TCache.flush(true); });
+        // pagehide는 새로고침/bfcache에서 beforeunload보다 확실히 발화한다.
+        // "새로고침하면 번역이 다 날아간다"의 직접 원인 중 하나가 배치 flush
+        // 창이 열린 채 unload되는 것이었다.
+        window.addEventListener('pagehide', function () { TCache.flush(true); History.flush(true); });
+        window.addEventListener('beforeunload', function () { TCache.flush(true); History.flush(true); });
         State.ready = true;
         if (cfg.debug) {
           window.__DCXLT__ = {
             C: C, cfg: cfg, State: State, Glossary: Glossary, Queue: Queue, Detect: Detect,
             Extract: Extract, Render: Render, Api: Api, reconcile: reconcile, Store: Store,
-            Router: Router, Viewport: Viewport, UI: UI, MockApi: MockApi, Util: Util, TCache: TCache
+            Router: Router, Viewport: Viewport, UI: UI, MockApi: MockApi, Util: Util, TCache: TCache,
+            History: History, HistoryUI: HistoryUI, Widget: Widget
           };
         }
       });
     },
     onChannelChange: function (newCh, oldCh) {
+      State.chNames.delete(oldCh);
+      State.chNames.delete(newCh);
       Queue.dropChannel(oldCh);
       Detect.stopObserving();
       Detect.probe();

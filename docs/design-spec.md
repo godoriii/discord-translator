@@ -127,6 +127,17 @@ const C = {
   VIEWPORT_DWELL_MS: 400,          // 화면에 이만큼 머물러야 백필 큐 진입
   BACKFILL_PER_MIN: 40,            // 분당 백필 상한 (라이브 신규 메시지는 미포함)
 
+  // ── 번역 기록 (v0.3.0, §4.13 History) ──
+  HISTORY_MAX_ENTRIES: 2000,
+  HISTORY_MAX_BYTES: 3_000_000,
+  HISTORY_FLUSH_IDLE_MS: 5000,
+  HISTORY_FLUSH_EVERY_N: 25,       // TCache(100)보다 촘촘히 flush — "새로고침해도 살아남는다"는
+                                    // 존재 이유상 배치 창이 길면 목적이 깨짐
+  HISTORY_SRC_MAX: 2000,
+  HISTORY_PH_MAX: 12,
+  HISTORY_PH_RAW_MAX: 400,
+  WIDGET_TICK_MS: 500,             // 플로팅 위젯 배지 갱신 주기
+
   // 모델별 prompt cache 최소 프리픽스(토큰). 설정 패널 경고에 사용.
   CACHE_MIN_TOKENS: {
     'claude-opus-5': 512, 'claude-fable-5': 512,
@@ -191,6 +202,7 @@ const DEFAULTS = {
 | `dcxlt.glossary.remote.v1` | JSON | `{url, etag, lastModified, fetchedAt, rev, entries:[...]}` | 원격 스냅샷 |
 | `dcxlt.glossary.local.v1` | JSON | `{entries:[...]}` | 사용자 추가/오버라이드. `ko:null`이면 해당 항목 비활성 |
 | `dcxlt.tcache.v1` | JSON | `{v:1, items:{[key]:Entry}}` | 번역 캐시. 디바운스 flush |
+| `dcxlt.history.v1` | JSON | `{v:1, items:{[id\|hash]:HistoryEntry}}` | 영구 번역 기록 (v0.3.0, §4.13). model/targetLang 무관 키. 최대 2000건/3MB, FIFO |
 | `dcxlt.stats.v1` | JSON | `{day:'YYYY-MM-DD', reqs, in, out, cw, cr, errors}` | 일 단위 롤오버 |
 | `dcxlt.diag.v1` | JSON | 마지막 셀렉터 프로브 결과 + UA + 스크립트 버전 | "진단 복사" 메뉴용 |
 
@@ -408,8 +420,61 @@ UI.registerMenuCommands()                 // 설정 열기 / 용어집 새로고
 UI.bindHotkeys()                          // 입력창 포커스 중이면 무시
 Boot.init()                               // Store.load → Render.injectStyles → Glossary.init
                                           // → Detect.probe(재시도) → Router.start → Detect.startObserving
-                                          // → Viewport.attach → 첫 reconcile → UI 등록
+                                          // → Viewport.attach → 첫 reconcile → UI 등록 → Widget.apply
 ```
+
+### 4.13 `History` (영구 번역 기록, v0.3.0, §4b — 스크립트 내부 배너 번호)
+```js
+History.key(id, hash) -> string           // id + '|' + hash — model/targetLang 무관
+History.append(entry)                     // 같은 key면 교체(중복 아님). 25건 또는 5s idle에 flush
+History.get(id, hash) -> Entry|null
+History.remove(id, hash)
+History.all() -> Entry[]                  // tt(번역 시각) 내림차순
+History.channels() -> {id, name}[]
+History.clear()
+History.flush(force=false)                // 항목 2000 + 3MB 상한을 O(n) 단일 패스로 강제(TCache의
+                                          // O(n²) 초과-바이트 while 루프보다 낫다), 잘려나간 항목은
+                                          // State.historyMap에서도 제거해 메모리·저장소 불일치 방지
+History._packPh(placeholders) -> ph[]     // {t,l,r?} — raw(outerHTML) 400B 초과 시 버림, 최대 12개
+History._unpackPh(ph) -> placeholders[]
+History.flatten(text, ph) -> string       // {{n}} 마커 → label 치환한 평문(표시·검색·내보내기 전용)
+History.timeOf(msgId) -> number           // 스노플레이크 → ms (Number 나눗셈, BigInt 불필요)
+```
+TCache 키(`msgId|hash|targetLang|model`)는 모델을 바꾸거나 LRU에서 밀리면 통째로 고아가 된다.
+History는 `id|hash`만으로 키가 잡혀 모델/언어와 무관하게 살아남는다. `Queue._commit`에서 커밋마다
+(skip 제외) 함께 적재되고, `reconcile`/`reconcileEmbeds`/`Viewport.translateVisibleNow`의
+`historyRestore()` 폴백이 TCache 미스 시 여기서 번역을 되살려 현재 모델 키로 TCache를 다시 데운다.
+`ko`는 `{{n}}` 마커가 살아있는 원형 그대로, `ph`(압축 placeholders)와 `gv`/`gt`(용어집 rev·매칭
+목록, 원본 그대로)를 함께 저장해야 `Extract.rehydrate`가 매칭 안 되는 마커를 지우지 않고, 복원 후에도
+`glossaryRecheck`가 예전과 동일하게 재현된다.
+
+### 4.14 `Widget` (플로팅 위젯, v0.3.0, §13b)
+```js
+Widget.apply()                            // showWidget:false면 unmount, 아니면 ensure
+Widget.ensure()                           // 2초 간격 setInterval — 호스트가 사라졌으면 재마운트
+Widget.mount() / Widget.unmount()
+Widget.onGo()                             // 꺼짐이면 재활성화, 켜짐이면 화면 즉시 번역(dwell/예산 무시)
+Widget.refresh()                          // 라벨/톤/배지(대기+진행중 합)
+```
+`#dcxlt-widget-host`(shadow DOM, `right:16px;bottom:96px;z-index:2147483000`). `reconcile()`에
+얹지 않고 독립 `setInterval(Widget.ensure, 2000)`으로 유지하는 이유: reconcile은
+`cfg.enabled===false`면 즉시 return하는데, 위젯은 바로 그 순간 `⏸ 꺼짐`을 보여줘야 한다. 버튼은
+`tabindex="-1"` + `mousedown` `preventDefault`로 포커스를 절대 뺏지 않는다(채팅 입력 중 클릭해도
+커서 유지).
+
+### 4.15 `HistoryUI` (번역 기록 오버레이, v0.3.0, §13c)
+```js
+HistoryUI.open() / HistoryUI.close()
+HistoryUI.render()                        // 날짜→채널 그룹핑, 검색/채널 필터 적용된 행만
+HistoryUI._rows() -> Entry[]              // 필터링(대소문자 무시 검색, 채널 일치)
+HistoryUI._download(filename, text, mime) // Blob + <a download>; 하네스가 스텁 가능하도록 분리
+HistoryUI._navigate(entry)                // 동일 채널: scrollIntoView+pushState / 채널 전환:
+                                          // pushState+합성 popstate → 800ms 후 미도달 시 location.assign 폴백
+```
+`#dcxlt-history-host`는 설정 패널(560px 모달, 탭 문자열 병렬 목록)과 분리된 독립 shadow host다 —
+표 형태에는 내부 스크롤 영역이 필요하고, 설정 호스트를 건드리면 시나리오 42가 검증하는 shadow 구조가
+흔들린다. `기록 지우기`는 `window.confirm` 대신 인라인 2단계 버튼(하네스·디스코드 이벤트 루프를
+막지 않기 위해). 메뉴 **번역 기록**, 단축키 **Alt+H**, 위젯 **☰**로 연다.
 
 ---
 
@@ -549,6 +614,8 @@ FUNCTION reconcile():
 ```
 
 **중복 삽입 방지의 근거**: 블록은 `msgId` 하나당 하나이며, 판별은 노드 identity가 아니라 `data-dcxlt-id` + `data-dcxlt-hash` 속성이다. 가상화로 노드가 통째로 새로 만들어져도 msgId가 같으므로 캐시에서 즉시 복원되고 API 호출은 0이다. WeakSet/노드 마킹은 재마운트 시 무의미하므로 쓰지 않는다.
+
+**v0.3.0 변경 — `seen` vs `resolved` (previousSeen 영구 강등 버그 수정)**: 위 의사코드의 `seen`은 스윕에서 마운트된 전부(블록 GC·임베드 전달용)를 모으고, 스윕 종료 시 그대로 `State.previousSeen`에 대입됐다. 그런데 `decidePriority`가 쓰는 "새로 마운트됨" 판정(`isNewlyMounted = !State.previousSeen.has(msgId)`)은 라이브 경로(우선순위 0)의 자격을 단 한 번의 스윕에서만 부여한다 — 사용자가 스크롤을 올려 `nearBottom=false`인 스윕에서 메시지가 마운트되면 그 자격이 아무 효과 없이 소진되고, 다음 스윕부턴 영원히 "새로 마운트된 게 아님" 취급을 받아 400ms dwell + 분당 40건 백필 버킷 경로로만 진입할 수 있었다(그 버킷은 스크롤업 직후엔 보통 비어 있다). 실사용 증상 "스크롤을 올렸다 내리면 새 메시지가 번역되지 않는다"의 근본 원인. **수정**: `seen`(마운트 전부)과 `resolved`(이번 스윕에서 실제로 처리 — 캐시 히트/기록 폴백/스킵/에러 유지/큐 진입 중 하나라도 해당)를 분리하고, `State.previousSeen = resolved`로 대입한다. 아무것도 하지 못한 스윕은 다음 스윕에서도 여전히 "새로 마운트됨"으로 재평가된다.
 
 ### 5.3 텍스트 추출 (노드 워킹 + 플레이스홀더 토큰화)
 
@@ -1014,6 +1081,10 @@ FUNCTION parseResponse(json):
 | 40 | API 키 없음 (apiKey='') | 요청 0건, 상태 칩·설정 패널로 안내, 키 저장 즉시(재로드 없이) 번역 시작 |
 | 41 | 401로 꺼짐(disabledReason='auth') → 새 키 저장 | mockApi 변경만으로는 안 켜짐, Store.setApiKey로 자동 enabled=true·disabledReason='' · dcxlt-hidden 해제 · 메시지 재시도 완료, 패널 저장(stale 체크박스)도 enabled를 되돌리지 않음 |
 | 42 | 설정 패널 연결 테스트 버튼 | mockApi=ok → "연결 성공" 텍스트, mockApi=authfail → "401" 포함 텍스트, 저장된 키 힌트가 마스킹되어 표시/키 비우면 "없음"으로 전환 |
+| 43 | 번역 기록 적재 + 중복 제거 + 상한 (v0.3.0) | 커밋마다 `History`에 적재(skip 제외), 동일 id+hash 재적재는 교체(항목 수 불변), `HISTORY_MAX_ENTRIES` 초과 시 가장 오래된 tt부터 FIFO 축출 |
+| 44 | 기록 폴백 렌더 (v0.3.0) | `TCache.clear()` 후에도 API 재호출 없이 기록에서 즉시 복원(멘션/링크 자리표시자 포함 원본과 동일 렌더), 모델 변경 후에도 새 모델 키로 TCache가 다시 데워짐 |
+| 45 | 번역 기록 오버레이 (v0.3.0) | 열기(메뉴/Alt+H/위젯 ☰), 대소문자 무시 검색, 채널 필터, `.txt`/`.json` 내보내기(스텁된 `_download`로 검증), 개별 삭제, 2단계 `기록 지우기`(`window.confirm` 미사용), 캐시 비우기와 분리(서로 지우지 않음), Esc로 닫힘 |
+| 46 | 스크롤업 중 도착한 메시지 + 위젯 즉시 번역 (v0.3.0) | (A) `previousSeen`/`resolved` 분리 회귀 검증: 스크롤업 중 마운트 → 하단 복귀 시 dwell/예산 없이 즉시 번역(priority 0). (B) 위젯 `▶ 번역`이 backfill 제약 무시하고 화면 메시지 번역. (C) 꺼짐 시 `⏸ 꺼짐` 표시, 클릭 재활성화. (D) `showWidget` 설정으로 위젯 표시/숨김. (E) Alt+T 재활성화가 1500ms 인터벌을 기다리지 않고 즉시 `reconcile()` |
 
 ---
 
