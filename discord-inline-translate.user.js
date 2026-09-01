@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Inline Translator (KO)
 // @namespace    https://github.com/godoriii/discord-translator
-// @version      0.2.1
+// @version      0.2.2
 // @description  디스코드 웹 채팅을 사용자 용어집 기반으로 한국어 인라인 번역
 // @match        https://discord.com/*
 // @match        https://ptb.discord.com/*
@@ -31,7 +31,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '0.2.1';
+  var SCRIPT_VERSION = '0.2.2';
 
   // ===== 1. CONSTANTS =====
   var C = {
@@ -111,6 +111,10 @@
   var DEFAULTS = {
     schema: 1,
     enabled: true,
+    // 인증 실패(401/403)로 스크립트가 스스로 enabled를 껐을 때만 'auth'.
+    // 새 키를 저장하면 UI.reenableAfterAuth()가 이 값을 보고 자동으로
+    // 다시 켠다 — 사용자가 직접 끈 경우와 구분하기 위한 플래그.
+    disabledReason: '',
     autoTranslate: true,
     model: 'claude-opus-5',
     effort: 'low',
@@ -195,7 +199,10 @@
     previousSeen: new Set(),
     insertFail: { lastInsertedAt: new Map(), removalEvents: new Map(), accessoriesFallback: new Set() },
     mock: { rateLimitFired: false, error500Count: {} },
-    ready: false
+    ready: false,
+    // UI.promptForKey()가 페이지 로드당(그리고 키 저장 시마다) 한 번만
+    // "API 키가 없습니다" 안내를 띄우도록 하는 플래그.
+    keyPromptShown: false
   };
 
   // ===== 2. Util =====
@@ -309,8 +316,30 @@
     getApiKey: function () { return Store.get(StoreKeys.apiKey, '') || ''; },
     // 붙여넣기에 섞여 들어오는 공백/줄바꿈은 그대로 저장하면 인증 헤더가
     // 통째로 깨져 401이 난다 — 저장 시점에 항상 trim.
-    setApiKey: function (str) { var v = String(str || '').trim(); State.apiKey = v; Store.set(StoreKeys.apiKey, v); },
-    setCustomApiKey: function (str) { var v = String(str || '').trim(); State.customApiKey = v; Store.set(StoreKeys.customApiKey, v); },
+    setApiKey: function (str) {
+      var v = String(str || '').trim();
+      State.apiKey = v;
+      Store.set(StoreKeys.apiKey, v);
+      Store._afterKeySave(v);
+    },
+    setCustomApiKey: function (str) {
+      var v = String(str || '').trim();
+      State.customApiKey = v;
+      Store.set(StoreKeys.customApiKey, v);
+      Store._afterKeySave(v);
+    },
+    // 키(또는 셀렉터 URL) 저장 직후 공통 처리 — 호출 경로가 패널 저장이든
+    // (harness) 직접 Store.setApiKey 호출이든 동일하게 동작해야 한다:
+    // 1) "키 없음" 안내를 다시 띄울 수 있도록 1회성 플래그를 리셋하고,
+    // 2) 인증 실패로 꺼졌던 상태면 자동으로 되살리고,
+    // 3) 지금 화면에 보이는 메시지를 즉시 큐에 넣는다(재로드 불필요).
+    _afterKeySave: function (nonEmptyValue) {
+      State.keyPromptShown = false;
+      if (nonEmptyValue) UI.reenableAfterAuth();
+      if (UI._shadow) UI.refreshKeyHints(UI._shadow);
+      if (Api.configured()) Render.statusChip('API 키 저장됨 — 번역 시작', 'info');
+      reconcile();
+    },
     exportSettings: function () {
       var c = Object.assign({}, cfg);
       return JSON.stringify(c, null, 2);
@@ -1344,7 +1373,41 @@
         }
       };
     },
-    request: function (body) {
+    // provider별로 "번역을 시작해도 되는 최소 조건"이 다르다: 커스텀
+    // (OpenAI 호환) 프로바이더는 로컬 Ollama처럼 키가 아예 필요 없는
+    // 엔드포인트도 정상이라 Base URL만 있으면 되고, Anthropic은 키가
+    // 필수다. reconcile/Viewport/Queue.retry가 요청 전에 이걸로 게이트한다.
+    configured: function () {
+      if (!cfg) return false;
+      if (cfg.provider === 'openai') return !!cfg.customBaseUrl;
+      return !!State.apiKey;
+    },
+    // 설정 패널의 "연결 테스트" 버튼용. 실제 배치 프롬프트를 만들지 않고
+    // 최소 요청 하나만 보내 키/엔드포인트가 살아있는지 확인한다.
+    testConnection: function (overrides) {
+      var body = {
+        model: cfg.model,
+        max_tokens: 8,
+        messages: [{ role: 'user', content: 'ping' }]
+      };
+      return Api.request(body, overrides || {}).then(Api._formatTestResult);
+    },
+    _formatTestResult: function (res) {
+      var status = res.status;
+      if (status === 200) return { ok: true, status: status, text: '연결 성공 (' + cfg.model + ')' };
+      if (status === 401 || status === 403) return { ok: false, status: status, text: '키 거부 (401) — 키를 다시 확인하세요' };
+      if (status === 404) return { ok: false, status: status, text: '모델/엔드포인트 없음 (404)' };
+      if (status === 429) return { ok: false, status: status, text: '레이트리밋 (429) — 키는 유효합니다' };
+      if (status === 0) return { ok: false, status: status, text: '네트워크 실패 — Tampermonkey 접근 허용/URL 확인' };
+      var msg = (res.json && res.json.error && res.json.error.message) || 'request error';
+      return { ok: false, status: status, text: '실패 (' + status + '): ' + msg };
+    },
+    // opts.apiKey/opts.customApiKey override State.* for this one call only
+    // (used by testConnection to try a not-yet-saved, currently-typed key
+    // without persisting it first). No other call site passes opts, so
+    // normal translation requests are unaffected.
+    request: function (body, opts) {
+      opts = opts || {};
       return new Promise(function (resolve) {
         if (cfg.mockApi && cfg.mockApi !== 'off') {
           // Must resolve on a macrotask, never synchronously: a retrying
@@ -1359,7 +1422,8 @@
           var oUrl = Api._openaiUrl();
           if (!oUrl) { resolve({ status: 0, error: 'no-base-url' }); return; }
           var oHeaders = { 'content-type': 'application/json' };
-          if (State.customApiKey) oHeaders['authorization'] = 'Bearer ' + State.customApiKey;
+          var oKey = opts.customApiKey !== undefined ? opts.customApiKey : State.customApiKey;
+          if (oKey) oHeaders['authorization'] = 'Bearer ' + oKey;
           var extra = Util.safeJsonParse(cfg.customHeaders || '');
           if (extra.ok && extra.value && typeof extra.value === 'object' && !Array.isArray(extra.value)) {
             Object.assign(oHeaders, extra.value);
@@ -1382,7 +1446,7 @@
         }
         var headers = {
           'content-type': 'application/json',
-          'x-api-key': State.apiKey,
+          'x-api-key': opts.apiKey !== undefined ? opts.apiKey : State.apiKey,
           'anthropic-version': '2023-06-01',
           'anthropic-dangerous-direct-browser-access': 'true'
         };
@@ -1729,11 +1793,27 @@
           break;
         }
         case 'auth': {
+          // The batch that just failed, plus anything still waiting to be
+          // sent, was rendered as a 'loading' block with a hash matching
+          // its current content — reconcile()'s fast path treats that as
+          // "already handled" and would otherwise leave it stuck forever,
+          // even after the client re-enables. Clear those blocks (and drop
+          // them from previousSeen so they count as newly-mounted again)
+          // so the next reconcile() picks them right back up.
+          var stuckItems = batch.concat(State.queue.queued);
+          if (State.queue._pendingParts) {
+            State.queue._pendingParts.forEach(function (part) { stuckItems = stuckItems.concat(part); });
+          }
           cfg.enabled = false;
-          Store.saveSettings({ enabled: false });
+          Store.saveSettings({ enabled: false, disabledReason: 'auth' });
           Queue._stopAll();
+          Render.setGlobalHidden(true);
+          stuckItems.forEach(function (it) {
+            Render.remove(it.msgId);
+            State.previousSeen.delete(it.msgId);
+          });
           var authDetail = (res.json && res.json.error && res.json.error.message) ? (' (' + String(res.json.error.message).slice(0, 120) + ')') : '';
-          Render.toast('API 키가 거부되었습니다' + authDetail, [{ label: '설정 열기', fn: function () { UI.openSettings('일반'); } }]);
+          Render.toast('API 키가 거부되었습니다' + authDetail + ' 새 키를 저장하면 자동으로 다시 켜집니다.', [{ label: '설정 열기', fn: function () { UI.openSettings('일반'); } }]);
           UI.openSettings('일반');
           break;
         }
@@ -1838,6 +1918,7 @@
       State.queue._pendingParts = [];
     },
     retry: function (msgId) {
+      if (!Api.configured()) { UI.promptForKey(); return; }
       var f = State.queue.failed.get(msgId);
       if (!f) return;
       State.queue.failed.delete(msgId);
@@ -1897,6 +1978,7 @@
       return true;
     },
     translateVisibleNow: function () {
+      if (!Api.configured()) { UI.promptForKey(); return; }
       var mounted = Detect.listMounted();
       var ch = Router.currentChannel();
       mounted.contentNodes.forEach(function (node) {
@@ -1995,7 +2077,10 @@
         var combo = UI._comboFromEvent(e);
         if (combo === cfg.hotkeyToggle) {
           e.preventDefault();
-          Store.saveSettings({ enabled: !cfg.enabled });
+          var nextEnabled = !cfg.enabled;
+          var togglePatch = { enabled: nextEnabled };
+          if (nextEnabled) togglePatch.disabledReason = ''; // B.3: user-enable clears an auth auto-disable too
+          Store.saveSettings(togglePatch);
           Render.setGlobalHidden(!cfg.enabled);
           Render.statusChip(cfg.enabled ? '번역 켜짐' : '번역 꺼짐', 'info');
         } else if (combo === cfg.hotkeyTranslateView) {
@@ -2085,6 +2170,7 @@
         '</select>' +
         '<div data-el="anthropicFields">' +
         '<label>Anthropic API 키</label><input type="password" data-f="apiKey">' +
+        '<div class="small" id="dcxlt-keyhint"></div>' +
         '<label>모델</label><select data-f="model">' +
         '<option value="claude-opus-5">claude-opus-5 (캐시 최소 512토큰)</option>' +
         '<option value="claude-sonnet-5">claude-sonnet-5 (캐시 최소 1024토큰)</option>' +
@@ -2102,9 +2188,11 @@
         '<label>Base URL (끝의 /chat/completions 는 자동으로 붙음)</label><input type="text" data-f="customBaseUrl" placeholder="https://generativelanguage.googleapis.com/v1beta/openai">' +
         '<label>모델명</label><input type="text" data-f="customModel" placeholder="gemini-3.7-flash">' +
         '<label>API 키</label><input type="password" data-f="customApiKey">' +
+        '<div class="small" id="dcxlt-customkeyhint"></div>' +
         '<label>추가 헤더 (JSON, 선택)</label><textarea data-f="customHeaders" placeholder=\'{"HTTP-Referer": "https://example.com"}\'></textarea>' +
         '<div class="small">목록에 없는 도메인은 첫 요청 때 Tampermonkey가 접근 허용을 물어봅니다.</div>' +
         '</div>' +
+        '<div class="row"><button type="button" data-act="test-connection">연결 테스트</button><span class="small" id="dcxlt-conntest"></span></div>' +
         '<label><input type="checkbox" data-f="enabled"> 번역 활성화</label>' +
         '<label><input type="checkbox" data-f="autoTranslate"> 자동번역</label>' +
         '<label><input type="checkbox" data-f="translateEmbeds"> 임베드 번역</label>' +
@@ -2157,26 +2245,46 @@
             return;
           }
         }
+        // B.4: process key/endpoint fields FIRST. Store.setApiKey/
+        // setCustomApiKey (and a base-URL-only fix, below) can silently
+        // re-enable a client an earlier auth failure turned off — but the
+        // 번역 활성화 checkbox can still be showing that stale "off" state,
+        // since this panel isn't rebuilt/refilled on every open (see
+        // openSettings). Reading the checkbox before this would re-persist
+        // enabled:false in the patch below and undo the reenable.
+        var key = shadow.querySelector('[data-f="apiKey"]').value;
+        if (key) Store.setApiKey(key);
+        var customKey = shadow.querySelector('[data-f="customApiKey"]').value;
+        if (customKey) Store.setCustomApiKey(customKey);
+        var newBaseUrl = shadow.querySelector('[data-f="customBaseUrl"]').value.trim();
+        if (newBaseUrl) UI.reenableAfterAuth();
+        var enabledEl = shadow.querySelector('[data-f="enabled"]');
+        if (cfg.enabled) enabledEl.checked = true;
+
         var patch = {
           provider: shadow.querySelector('[data-f="provider"]').value,
-          customBaseUrl: shadow.querySelector('[data-f="customBaseUrl"]').value.trim(),
+          customBaseUrl: newBaseUrl,
           customModel: shadow.querySelector('[data-f="customModel"]').value.trim(),
           customHeaders: headersText,
           model: shadow.querySelector('[data-f="model"]').value,
-          enabled: shadow.querySelector('[data-f="enabled"]').checked,
+          enabled: enabledEl.checked,
           autoTranslate: shadow.querySelector('[data-f="autoTranslate"]').checked,
           translateEmbeds: shadow.querySelector('[data-f="translateEmbeds"]').checked,
           showOriginal: shadow.querySelector('[data-f="showOriginal"]').checked,
           hotkeyToggle: shadow.querySelector('[data-f="hotkeyToggle"]').value
         };
-        var key = shadow.querySelector('[data-f="apiKey"]').value;
-        if (key) Store.setApiKey(key);
-        var customKey = shadow.querySelector('[data-f="customApiKey"]').value;
-        if (customKey) Store.setCustomApiKey(customKey);
+        if (patch.enabled) patch.disabledReason = ''; // B.3: checkbox-enable also clears an auth auto-disable
         Store.saveSettings(patch);
         Render.setGlobalHidden(!cfg.enabled);
         UI._refreshCacheWarn(shadow);
+        UI.refreshKeyHints(shadow);
+        State.keyPromptShown = false;
+        if (Api.configured()) Render.statusChip('API 키 저장됨 — 번역 시작', 'info');
+        reconcile();
         Render.toast('저장됨');
+      });
+      shadow.querySelector('[data-act="test-connection"]').addEventListener('click', function () {
+        UI.testConnection(shadow);
       });
       shadow.querySelector('[data-act="glossary-refresh"]').addEventListener('click', function () {
         var url = shadow.querySelector('[data-f="glossaryUrl"]').value;
@@ -2238,6 +2346,65 @@
       UI._refreshCacheWarn(shadow);
       UI._refreshGlossaryStatus(shadow);
       UI._refreshDiag(shadow);
+      UI.refreshKeyHints(shadow);
+    },
+    // 저장된 키는 절대 입력칸에 되채우지 않는다(비밀번호 필드 원칙, §13
+    // _fillFromCfg 주석 참고) — 대신 마스킹된 힌트 텍스트로만 "뭔가
+    // 저장돼 있다/없다"를 보여준다. Store.setApiKey/setCustomApiKey와
+    // save-general 핸들러 양쪽에서 호출해 패널이 열려 있는 동안은 항상
+    // 최신 상태를 반영한다(패널 자체는 재오픈 시 다시 채워지지 않는다).
+    refreshKeyHints: function (shadow) {
+      shadow = shadow || UI._shadow;
+      if (!shadow) return;
+      function mask(k) { return k.slice(0, 6) + '…' + k.slice(-4); }
+      var keyEl = shadow.querySelector('#dcxlt-keyhint');
+      if (keyEl) keyEl.textContent = State.apiKey ? ('저장된 키: ' + mask(State.apiKey)) : '저장된 키 없음';
+      var custEl = shadow.querySelector('#dcxlt-customkeyhint');
+      if (custEl) {
+        custEl.textContent = State.customApiKey
+          ? ('저장된 커스텀 키: ' + mask(State.customApiKey))
+          : '저장된 커스텀 키 없음 (로컬 서버 등 키 불필요 시 정상)';
+      }
+    },
+    // "API 키가 없습니다" 안내를 페이지 로드당 한 번만 띄운다. 키/Base URL을
+    // 저장하면(Store._afterKeySave) 이 플래그가 리셋돼 다음에 또 설정이
+    // 비어 있으면 다시 안내한다.
+    promptForKey: function () {
+      if (State.keyPromptShown) return;
+      State.keyPromptShown = true;
+      Render.statusChip('API 키가 없습니다 — 설정에서 입력하세요', 'warn');
+      Render.toast('API 키가 설정되지 않아 번역을 시작하지 않았습니다. 키를 저장하면 바로 시작됩니다.', [
+        { label: '설정 열기', fn: function () { UI.openSettings('일반'); } }
+      ]);
+      UI.openSettings('일반');
+    },
+    // 인증 실패로 disabledReason==='auth'가 된 상태에서만 동작하는 자동
+    // 복구. 사용자가 직접 끈 경우(disabledReason==='')는 절대 건드리지
+    // 않는다 — Store.setApiKey/setCustomApiKey(비어있지 않은 값)와
+    // save-general의 Base URL 저장 경로에서 호출한다.
+    reenableAfterAuth: function () {
+      if (cfg && cfg.disabledReason === 'auth') {
+        Store.saveSettings({ enabled: true, disabledReason: '' });
+        Render.setGlobalHidden(false);
+        Render.statusChip('새 키 저장 — 번역 다시 켜짐', 'info');
+      }
+    },
+    // 설정 패널의 "연결 테스트" 버튼. 입력칸에 방금 타이핑된 키가 있으면
+    // 그걸(아직 저장 전이어도) 쓰고, 없으면 저장된 키로 시험한다.
+    testConnection: function (shadow) {
+      shadow = shadow || UI._shadow;
+      if (!shadow) return;
+      var resultEl = shadow.querySelector('#dcxlt-conntest');
+      if (resultEl) resultEl.textContent = '테스트 중…';
+      var typedKey = (shadow.querySelector('[data-f="apiKey"]').value || '').trim();
+      var typedCustomKey = (shadow.querySelector('[data-f="customApiKey"]').value || '').trim();
+      var overrides = {
+        apiKey: typedKey || State.apiKey,
+        customApiKey: typedCustomKey || State.customApiKey
+      };
+      Api.testConnection(overrides).then(function (result) {
+        if (resultEl) resultEl.textContent = result.text;
+      });
     },
     _refreshCacheWarn: function (shadow) {
       var el = shadow.querySelector('[data-el="cacheWarn"]');
@@ -2329,6 +2496,7 @@
 
   function reconcile() {
     if (!cfg || !cfg.enabled) return;
+    if (!Api.configured()) { UI.promptForKey(); return; }
     var ch = Router.currentChannel();
     var mounted = Detect.listMounted();
     var seen = new Set();

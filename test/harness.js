@@ -50,7 +50,7 @@
   window.__DCXLT_RESET_XHR_COUNT__ = function () { xhrCallCount = 0; xhrLog.length = 0; };
 
   var BASE_SETTINGS = {
-    schema: 1, enabled: true, autoTranslate: true, model: 'claude-opus-5', effort: 'low', maxTokens: 4096,
+    schema: 1, enabled: true, disabledReason: '', autoTranslate: true, model: 'claude-opus-5', effort: 'low', maxTokens: 4096,
     targetLang: 'ko', targetLangName: '한국어',
     glossaryUrl: 'https://example.invalid/glossary.json', glossaryAutoRefresh: false,
     glossaryStrategy: 'auto', glossaryAudit: true,
@@ -140,10 +140,25 @@
     d.State.mock.rateLimitFired = false;
     d.State.mock.error500Count = {};
     d.MockApi._manualRetryFlag = false;
-    d.Store.saveSettings(Object.assign({}, BASE_SETTINGS, overrides || {}));
+    // apiKey isn't part of cfg/settings (it lives in State.apiKey / GM
+    // storage via Store.setApiKey), so it's pulled out of overrides before
+    // the settings patch and applied separately below. Scenarios that don't
+    // pass an apiKey override get a fresh key every reset so the A-guard
+    // (Api.configured()) never breaks scenarios that don't care about it;
+    // `apiKey: ''` clears it (scenario 40).
+    var ov = Object.assign({}, overrides || {});
+    var hasApiKeyOverride = Object.prototype.hasOwnProperty.call(ov, 'apiKey');
+    var apiKeyOverride = ov.apiKey;
+    delete ov.apiKey;
+    d.Store.saveSettings(Object.assign({}, BASE_SETTINGS, ov));
     window.__DCXLT_RESET_XHR_COUNT__();
     resetDom();
     d.Detect.probe();
+    // Store.setApiKey() has side effects (it can reconcile() immediately)
+    // — run it after resetDom()/probe() so it only ever sees this
+    // scenario's own (currently empty) DOM, never the previous scenario's
+    // stale fixtures.
+    d.Store.setApiKey(hasApiKeyOverride ? apiKeyOverride : 'sk-ant-harness');
     d.reconcile();
   }
 
@@ -205,7 +220,7 @@
   var msgIdCounter = 1;
   function freshId() { return '30000000000' + String(msgIdCounter++).padStart(7, '0'); }
 
-  // ---- 39 scenarios ----------------------------------------------------------
+  // ---- 42 scenarios ----------------------------------------------------------
   var scenarios = [];
 
   function scenario(name, fn) { scenarios.push({ name: name, fn: fn }); }
@@ -915,6 +930,95 @@
     assertTrue(!sizes.slice(1).some(function (n) { return n >= 5; }), '첫 배치 이후 실패한 크기(≥5)로 되병합되면 안 됨(관측 ' + JSON.stringify(sizes) + ')');
     assertEq(D.State.queue.failed.size, 0, '429는 실패 확정이 아니어야 함');
     ids.forEach(function (id) { assertEq(blockEl(id).dataset.state, 'loading', id + ' 블록은 loading 대기여야 함'); });
+  });
+
+  scenario('40. API 키 없음 → 요청 0건 + 안내, 키 저장 즉시 번역 시작', async function () {
+    resetState({ apiKey: '' });
+    var D = DX();
+    var calls = 0;
+    var origHandle = D.MockApi.handle;
+    D.MockApi.handle = function () { calls++; return origHandle.apply(D.MockApi, arguments); };
+    var id = freshId();
+    try {
+      addMessage({ msgId: id, text: 'no key yet message' });
+      forceReconcile();
+      await sleep(700);
+      assertEq(calls, 0, '키가 없으면 API 호출이 없어야 함');
+      assertEq(blockEl(id), null, '키가 없으면 번역 블록이 생기지 않아야 함');
+      var chip = document.getElementById('dcxlt-statuschip');
+      assertTrue(!!chip && !chip.hidden, '상태 칩이 노출되어야 함');
+      assertTrue(chip.textContent.indexOf('API 키') !== -1, '상태 칩에 API 키 안내가 있어야 함 (관측: ' + chip.textContent + ')');
+      assertTrue(!!document.getElementById('dcxlt-settings-host'), '설정 패널이 존재해야 함');
+
+      D.Store.setApiKey('sk-ant-harness');
+      var ok = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'done'; }, 5000);
+      assertTrue(ok, '키 저장 즉시(재로드 없이) 번역이 시작되어 done이 되어야 함');
+      assertTrue(calls >= 1, '키 저장 후에는 API 호출이 있어야 함');
+    } finally {
+      D.MockApi.handle = origHandle;
+    }
+  });
+
+  scenario('41. 401로 꺼짐 → 새 키 저장 시 자동 재활성화', async function () {
+    resetState({ mockApi: 'authfail' });
+    var D = DX();
+    var id = freshId();
+    addMessage({ msgId: id, text: 'auth reenable test message' });
+    forceReconcile();
+    var offOk = await wait(function () { return D.cfg.enabled === false; }, 3000);
+    assertTrue(offOk, '인증 실패 시 cfg.enabled가 false로 꺼져야 함');
+    assertEq(D.cfg.disabledReason, 'auth', 'disabledReason이 auth로 표시되어야 함');
+    assertTrue(document.documentElement.classList.contains('dcxlt-hidden'), '인증 실패 시 dcxlt-hidden 클래스가 붙어야 함');
+
+    D.Store.saveSettings({ mockApi: 'ok' });
+    await sleep(300);
+    assertEq(D.cfg.enabled, false, 'mockApi만 바꾼다고 자동으로 켜지면 안 됨');
+    assertEq(D.cfg.disabledReason, 'auth', 'mockApi만 바꾼다고 disabledReason이 지워지면 안 됨');
+
+    D.Store.setApiKey('sk-ant-new');
+    var onOk = await wait(function () { return D.cfg.enabled === true; }, 3000);
+    assertTrue(onOk, '새 키 저장 시 cfg.enabled가 자동으로 true가 되어야 함');
+    assertEq(D.cfg.disabledReason, '', '재활성화되면 disabledReason이 지워져야 함');
+    assertTrue(!document.documentElement.classList.contains('dcxlt-hidden'), '재활성화되면 dcxlt-hidden 클래스가 제거되어야 함');
+    var doneOk = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'done'; }, 5000);
+    assertTrue(doneOk, '재활성화 후 원래 메시지가 자동으로 재시도되어 done이 되어야 함');
+
+    // B.4: 패널 저장 핸들러가 stale한(꺼져 있던 시점에 채워진) 체크박스를
+    // 그대로 읽어 방금 자동 복구된 enabled를 되돌리면 안 된다.
+    D.UI.openSettings('일반');
+    var panelHost = document.getElementById('dcxlt-settings-host');
+    assertTrue(!!panelHost && !!panelHost.shadowRoot, '설정 패널 shadowRoot이 있어야 함');
+    var shadow = panelHost.shadowRoot;
+    var keyInput = shadow.querySelector('[data-f="apiKey"]');
+    keyInput.value = 'sk-ant-panel-typed';
+    shadow.querySelector('[data-act="save-general"]').click();
+    assertEq(D.cfg.enabled, true, '패널에서 새 키를 저장해도 stale 체크박스 때문에 enabled가 false로 되돌아가면 안 됨');
+  });
+
+  scenario('42. 연결 테스트 버튼', async function () {
+    resetState({ mockApi: 'ok' });
+    var D = DX();
+    D.UI.openSettings('일반');
+    var panelHost = document.getElementById('dcxlt-settings-host');
+    var shadow = panelHost.shadowRoot;
+    var btn = shadow.querySelector('[data-act="test-connection"]');
+    assertTrue(!!btn, '연결 테스트 버튼이 있어야 함');
+    var resultEl = shadow.querySelector('#dcxlt-conntest');
+    btn.click();
+    var ok1 = await wait(function () { return (resultEl.textContent || '').indexOf('성공') !== -1; }, 3000);
+    assertTrue(ok1, '연결 테스트 성공 메시지가 떠야 함 (관측: ' + resultEl.textContent + ')');
+
+    D.Store.saveSettings({ mockApi: 'authfail' });
+    btn.click();
+    var ok2 = await wait(function () { return (resultEl.textContent || '').indexOf('401') !== -1; }, 3000);
+    assertTrue(ok2, '연결 테스트 실패(401) 메시지가 떠야 함 (관측: ' + resultEl.textContent + ')');
+
+    var hint = shadow.querySelector('#dcxlt-keyhint');
+    assertEq(hint.textContent.indexOf('저장된 키: sk-ant'), 0, '저장된 키 힌트가 마스킹된 키로 시작해야 함 (관측: ' + hint.textContent + ')');
+
+    D.Store.setApiKey('');
+    D.UI.openSettings('일반');
+    assertEq(hint.textContent, '저장된 키 없음', '키를 비우면 힌트가 없음으로 바뀌어야 함');
   });
 
   // ---- runner ----------------------------------------------------------

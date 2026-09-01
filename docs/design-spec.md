@@ -1011,6 +1011,9 @@ FUNCTION parseResponse(json):
 | 37 | max_tokens 다항목 배치 (mockApi=maxtokens) | 8→4→2→1 이분할 사다리, 전원 done, 호출 수 15(=2N-1) |
 | 38 | max_tokens 단건까지 잘림 (mockApi=maxtokens_always) | 5→3+2→… 이분할, 전원 FAILED(max_tokens), 호출 수 9(=2N-1), 수동 재시도 성공 |
 | 39 | max_tokens(200)↔429 교대 (mockApi=maxtokens_ratelimit) | 되병합 무한루프 없이 서킷브레이커(consecutiveRateLimits≥3) 발동, 호출 수 유계(≤8), 장기 일시정지(>20s) |
+| 40 | API 키 없음 (apiKey='') | 요청 0건, 상태 칩·설정 패널로 안내, 키 저장 즉시(재로드 없이) 번역 시작 |
+| 41 | 401로 꺼짐(disabledReason='auth') → 새 키 저장 | mockApi 변경만으로는 안 켜짐, Store.setApiKey로 자동 enabled=true·disabledReason='' · dcxlt-hidden 해제 · 메시지 재시도 완료, 패널 저장(stale 체크박스)도 enabled를 되돌리지 않음 |
+| 42 | 설정 패널 연결 테스트 버튼 | mockApi=ok → "연결 성공" 텍스트, mockApi=authfail → "401" 포함 텍스트, 저장된 키 힌트가 마스킹되어 표시/키 비우면 "없음"으로 전환 |
 
 ---
 
