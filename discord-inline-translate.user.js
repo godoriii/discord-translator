@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Inline Translator (KO)
 // @namespace    https://github.com/godoriii/discord-translator
-// @version      0.3.1
+// @version      0.4.0
 // @description  디스코드 웹 채팅을 사용자 용어집 기반으로 한국어 인라인 번역
 // @match        https://discord.com/*
 // @match        https://ptb.discord.com/*
@@ -31,7 +31,7 @@
 (function () {
   'use strict';
 
-  var SCRIPT_VERSION = '0.3.1';
+  var SCRIPT_VERSION = '0.4.0';
 
   // ===== 1. CONSTANTS =====
   var C = {
@@ -128,7 +128,11 @@
     // 새 키를 저장하면 UI.reenableAfterAuth()가 이 값을 보고 자동으로
     // 다시 켠다 — 사용자가 직접 끈 경우와 구분하기 위한 플래그.
     disabledReason: '',
-    autoTranslate: true,
+    // 번역 모드 (v0.4.0). 'manual'이 기본 — 메시지마다 [▶ 번역] 버튼이
+    // 붙고 스크립트는 스스로 API를 부르지 않는다. 'auto'는 v0.3.x까지의
+    // 동작(도착/백필 자동 번역). v0.3.x 설정에는 이 키가 없으므로
+    // Object.assign 병합만으로 기존 사용자도 manual로 넘어온다(의도된 것).
+    translateMode: 'manual',
     model: 'claude-opus-5',
     effort: 'low',
     maxTokens: 4096,
@@ -302,15 +306,23 @@
   // ===== 3. Store =====
   var Store = {
     load: function () {
-      var stored = Store.get(StoreKeys.settings, null);
-      cfg = Object.assign({}, DEFAULTS, stored || {});
-      cfg.schema = DEFAULTS.schema;
+      cfg = Store.migrate(Store.get(StoreKeys.settings, null));
       State.apiKey = Store.getApiKey();
       State.customApiKey = Store.get(StoreKeys.customApiKey, '') || '';
       TCache._load();
       History._load();
       Store._loadStats();
       return cfg;
+    },
+    // 저장된 설정 → 실행 설정. 부작용 없는 순수 함수로 유지한다(하네스가
+    // 저장소를 건드리지 않고 마이그레이션만 검증할 수 있어야 한다).
+    // v0.4.0: translateMode 키가 없는 v0.3.x 설정은 DEFAULTS를 따라
+    // 'manual'이 된다 — 기본값이 수동으로 바뀐 것이 곧 마이그레이션이다.
+    migrate: function (stored) {
+      var c = Object.assign({}, DEFAULTS, stored || {});
+      c.schema = DEFAULTS.schema;
+      if (c.translateMode !== 'auto' && c.translateMode !== 'manual') c.translateMode = 'manual';
+      return c;
     },
     get: function (key, def) {
       try {
@@ -1217,6 +1229,11 @@
         '.dcxlt-tools{margin-left:6px;display:inline-flex;gap:4px;vertical-align:middle}\n' +
         '.dcxlt-retry{cursor:pointer;border:none;background:transparent;color:inherit;opacity:.7;font-size:1em}\n' +
         '.dcxlt-retry:hover{opacity:1}\n' +
+        '.dcxlt[data-state="manual"]{border-left-color:transparent;padding-left:0;margin-top:1px}\n' +
+        '.dcxlt-mbtn{cursor:pointer;border:1px solid var(--background-modifier-accent,#3f4147);' +
+          'background:transparent;color:var(--text-muted,#949ba4);border-radius:10px;padding:1px 8px;' +
+          'font-size:.85em;line-height:1.4;opacity:.7}\n' +
+        '.dcxlt-mbtn:hover{opacity:1;color:var(--text-normal,#dbdee1)}\n' +
         '.dcxlt-warn{cursor:help;font-size:.85em;color:var(--status-warning,#f0b232);border:1px solid currentColor;border-radius:3px;padding:0 3px}\n' +
         '.dcxlt-dagger{color:var(--status-warning,#f0b232);cursor:help}\n' +
         '.dcxlt-toast{position:fixed;right:16px;bottom:56px;z-index:2147483000;background:#111214;color:#fff;padding:10px 14px;border-radius:6px;font-size:13px;max-width:320px;box-shadow:0 4px 16px rgba(0,0,0,.4)}\n' +
@@ -1259,7 +1276,24 @@
         var retryBtn = document.createElement('button'); retryBtn.type = 'button'; retryBtn.className = 'dcxlt-retry'; retryBtn.title = '재시도'; retryBtn.textContent = '↻';
         var warn = document.createElement('span'); warn.className = 'dcxlt-warn'; warn.hidden = true;
         tools.appendChild(retryBtn); tools.appendChild(warn);
-        block.appendChild(textSpan); block.appendChild(tools);
+        // 메시지별 수동 번역 버튼(v0.4.0). 블록 안에 함께 만들어 두고
+        // 상태에 따라 hidden만 토글한다 — 별도 요소를 따로 심으면
+        // 가상 리스트 재마운트마다 생사 관리를 이중으로 해야 한다.
+        var mbtn = document.createElement('button');
+        mbtn.type = 'button';
+        mbtn.className = 'dcxlt-mbtn';
+        mbtn.setAttribute('data-act', 'manual-translate');
+        mbtn.title = '이 메시지만 번역';
+        mbtn.textContent = '▶ 번역';
+        mbtn.hidden = true;
+        // 채팅 입력창 포커스 강탈 금지 — 위젯(§13b)과 같은 이유.
+        mbtn.addEventListener('mousedown', function (e) { e.preventDefault(); });
+        mbtn.addEventListener('click', function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          manualTranslateOne(msgId);
+        });
+        block.appendChild(mbtn); block.appendChild(textSpan); block.appendChild(tools);
         retryBtn.addEventListener('click', function () { Queue.retry(msgId); });
         isNewBlock = true;
         Render._detectRemoval(msgId, payload && payload.hash);
@@ -1269,6 +1303,10 @@
       if (payload && payload.hash) block.dataset.dcxltHash = payload.hash;
       var textSpan2 = block.querySelector('.dcxlt-text');
       var warnEl = block.querySelector('.dcxlt-warn');
+      var mbtnEl = block.querySelector('.dcxlt-mbtn');
+      if (mbtnEl) mbtnEl.hidden = (state !== 'manual');
+      var retryEl = block.querySelector('.dcxlt-retry');
+      if (retryEl) retryEl.hidden = (state === 'manual');
 
       if (state === 'loading') {
         textSpan2.textContent = '번역 중…';
@@ -1277,9 +1315,12 @@
       } else if (state === 'error') {
         textSpan2.textContent = (payload && payload.message) ? ('번역 실패: ' + payload.message) : '번역 실패';
         if (warnEl) warnEl.hidden = true;
-      } else if (state === 'skipped-manual') {
-        textSpan2.textContent = '번역 안 함 (호버 후 버튼)';
+      } else if (state === 'manual') {
+        // 수동 대기: 번역문 자리에 [▶ 번역] 버튼만 둔다. 편집으로 해시가
+        // 바뀌어 이 상태로 되돌아오는 경우가 있으므로 낡은 번역문을 지운다.
+        textSpan2.textContent = '';
         if (warnEl) warnEl.hidden = true;
+        block.classList.remove('dcxlt-spoiler');
       } else if (state === 'done') {
         var koText = (payload && payload.ko) || '';
         var placeholders = (payload && payload.placeholders) || [];
@@ -2185,7 +2226,7 @@
       bucket.count++;
       return true;
     },
-    // 위젯의 "▶ 번역" 전용. 마운트된 메시지를 즉시 dwelled로 승격하고
+    // 위젯의 "⚡ 전체 번역" 전용. 마운트된 메시지를 즉시 dwelled로 승격하고
     // 백필 예산 창을 새로 연다 — 버튼 직후의 reconcile 스윕이 400ms
     // dwell / 40-per-min 예산에 다시 걸려 아무것도 못 하는 일을 막는다.
     markVisibleDwelled: function () {
@@ -2218,6 +2259,27 @@
         Render.upsert(node, msgId, 'loading', { hash: item.hash });
         Queue.enqueue(item, 2);
       });
+      // 전체 번역은 임베드도 포함해야 한다 — 본문만 번역되고 임베드가
+      // 남는 것은 사용자 입장에서 "전체"가 아니다.
+      if (cfg.translateEmbeds) {
+        mounted.accNodes.forEach(function (accNode) {
+          Extract.fromAccessories(accNode).forEach(function (item) {
+            var anchor = item.anchorEl || accNode;
+            if (Extract.shouldSkip(item).skip) return;
+            var ehit = TCache.get(TCache.key(item.msgId, item.hash));
+            if (ehit) {
+              Render.upsert(anchor, item.msgId, 'done', Object.assign({}, ehit, { hash: item.hash }));
+              History.recordFromCache(item, ch, ehit);
+              return;
+            }
+            if (historyRestore(anchor, item.msgId, item, ch)) return;
+            if (Queue.has(item.msgId, item.hash)) return;
+            item.channelId = ch;
+            Render.upsert(anchor, item.msgId, 'loading', { hash: item.hash });
+            Queue.enqueue(item, 2);
+          });
+        });
+      }
     },
     // Re-checks which mounted messages are actually on-screen right now and
     // (re)starts their dwell timer. Used on tab-resume (visibilitychange ->
@@ -2338,6 +2400,11 @@
       // 이미 만들어진 상태의 재오픈(가장 흔한 경로)은 _fillFromCfg를 다시
       // 타지 않는다 — 그 사이 자동완성이 채워 넣었을 수 있으니 열 때마다
       // 다시 비운다.
+      // 패널 재오픈은 _fillFromCfg를 타지 않는다 — 위젯 칩으로 모드를 바꾼
+      // 뒤 패널을 열면 셀렉트가 낡은 값을 보여주고, 그 상태로 저장을 누르면
+      // 모드가 조용히 되돌아간다. 모드만 다시 동기화한다.
+      var modeSel = UI._shadow && UI._shadow.querySelector('[data-f="translateMode"]');
+      if (modeSel) modeSel.value = (cfg.translateMode === 'auto') ? 'auto' : 'manual';
       UI._clearKeyFields(UI._shadow);
     },
     closeSettings: function () { if (UI._root) UI._root.hidden = true; },
@@ -2452,7 +2519,12 @@
         '</div>' +
         '<div class="row"><button type="button" data-act="test-connection">연결 테스트</button><span class="small" id="dcxlt-conntest"></span></div>' +
         '<label><input type="checkbox" data-f="enabled"> 번역 활성화</label>' +
-        '<label><input type="checkbox" data-f="autoTranslate"> 자동번역</label>' +
+        '<label>번역 모드</label><select data-f="translateMode">' +
+        '<option value="manual">수동 — 메시지마다 [▶ 번역] 버튼 (기본)</option>' +
+        '<option value="auto">자동 — 도착하는 메시지를 즉시 번역</option>' +
+        '</select>' +
+        '<div class="small">수동 모드에서도 이미 번역해 둔 메시지(캐시·기록)는 버튼 없이 바로 표시되고, ' +
+        '위젯의 <b>⚡ 전체 번역</b>은 화면에 보이는 메시지를 한 번에 번역합니다.</div>' +
         '<label><input type="checkbox" data-f="translateEmbeds"> 임베드 번역</label>' +
         '<label><input type="checkbox" data-f="showOriginal"> 원문 표시</label>' +
         '<label><input type="checkbox" data-f="showWidget"> 번역 버튼(플로팅 위젯) 표시</label>' +
@@ -2496,6 +2568,7 @@
         });
       });
       shadow.querySelector('[data-act="save-general"]').addEventListener('click', function () {
+        var prevMode = cfg.translateMode;
         var headersText = shadow.querySelector('[data-f="customHeaders"]').value.trim();
         if (headersText) {
           var hr = Util.safeJsonParse(headersText);
@@ -2544,7 +2617,7 @@
           customHeaders: headersText,
           model: shadow.querySelector('[data-f="model"]').value,
           enabled: enabledEl.checked,
-          autoTranslate: shadow.querySelector('[data-f="autoTranslate"]').checked,
+          translateMode: shadow.querySelector('[data-f="translateMode"]').value === 'auto' ? 'auto' : 'manual',
           translateEmbeds: shadow.querySelector('[data-f="translateEmbeds"]').checked,
           showOriginal: shadow.querySelector('[data-f="showOriginal"]').checked,
           showWidget: shadow.querySelector('[data-f="showWidget"]').checked,
@@ -2552,8 +2625,14 @@
         };
         if (patch.enabled) patch.disabledReason = ''; // B.3: checkbox-enable also clears an auth auto-disable
         Store.saveSettings(patch);
+        // 모드가 바뀌면 previousSeen을 비운다. 수동 대기 블록도 매 스윕
+        // resolved에 들어가므로, 비우지 않으면 자동으로 전환한 직후의
+        // 스윕이 화면의 메시지를 "이미 본 것"으로 보고 라이브 경로(priority
+        // 0)를 건너뛰어 백필 대기로 강등시킨다(= 전환해도 아무 일도 안 남).
+        if (patch.translateMode !== prevMode) State.previousSeen = new Set();
         Render.setGlobalHidden(!cfg.enabled);
         Widget.apply();
+        Widget.refresh();
         UI._refreshCacheWarn(shadow);
         UI.refreshKeyHints(shadow);
         State.keyPromptShown = false;
@@ -2621,7 +2700,7 @@
       UI._toggleProviderFields(shadow);
       shadow.querySelector('[data-f="model"]').value = cfg.model;
       shadow.querySelector('[data-f="enabled"]').checked = cfg.enabled;
-      shadow.querySelector('[data-f="autoTranslate"]').checked = cfg.autoTranslate;
+      shadow.querySelector('[data-f="translateMode"]').value = (cfg.translateMode === 'auto') ? 'auto' : 'manual';
       shadow.querySelector('[data-f="translateEmbeds"]').checked = cfg.translateEmbeds;
       shadow.querySelector('[data-f="showOriginal"]').checked = cfg.showOriginal;
       shadow.querySelector('[data-f="showWidget"]').checked = cfg.showWidget !== false;
@@ -2767,10 +2846,12 @@
         '.badge{min-width:16px;text-align:center;background:#5865f2;color:#fff;border-radius:9px;' +
           'padding:1px 6px;font-size:11px}' +
         '.ic{font-size:14px;opacity:.8}.ic:hover{opacity:1}' +
+        '.ic.mode{font-size:11px;border:1px solid #3f4147;border-radius:9px;padding:1px 6px;opacity:.9}' +
         '</style>' +
         '<div class="pill">' +
-          '<button class="go" data-act="go" tabindex="-1"><span class="lbl">▶ 번역</span></button>' +
+          '<button class="go" data-act="go" tabindex="-1" title="화면의 모든 메시지 번역"><span class="lbl">⚡ 전체 번역</span></button>' +
           '<span class="badge" hidden>0</span>' +
+          '<button class="ic mode" data-act="mode" tabindex="-1" title="번역 모드 전환 (수동 ↔ 자동)">수동</button>' +
           '<button class="ic" data-act="hist" tabindex="-1" title="번역 기록 (Alt+H)">☰</button>' +
           '<button class="ic" data-act="cfg" tabindex="-1" title="설정">⚙</button>' +
         '</div>';
@@ -2778,6 +2859,7 @@
       // 잃지 않아야 한다. tabindex=-1 만으로는 클릭 포커스를 못 막는다.
       sh.addEventListener('mousedown', function (e) { e.preventDefault(); });
       sh.querySelector('[data-act="go"]').addEventListener('click', Widget.onGo);
+      sh.querySelector('[data-act="mode"]').addEventListener('click', Widget.onModeToggle);
       sh.querySelector('[data-act="hist"]').addEventListener('click', function () { HistoryUI.open(); });
       sh.querySelector('[data-act="cfg"]').addEventListener('click', function () { UI.openSettings('일반'); });
       Widget._host = host; Widget._shadow = sh;
@@ -2800,13 +2882,28 @@
       Viewport.translateVisibleNow();
       reconcile();
       var added = (Queue.stats().pending + State.queue.inflightCount) - before;
-      Render.statusChip(added > 0 ? (added + '개 번역 시작') : '번역할 새 메시지 없음', 'info');
+      Render.statusChip(added > 0 ? ('전체 번역: ' + added + '개 시작') : '번역할 새 메시지 없음', 'info');
       Widget.refresh();
+    },
+    onModeToggle: function () {
+      var next = (cfg.translateMode === 'auto') ? 'manual' : 'auto';
+      Store.saveSettings({ translateMode: next });
+      // E8과 같은 이유 — 전환 직후 스윕이 라이브 경로를 건너뛰지 않게 한다.
+      State.previousSeen = new Set();
+      Render.statusChip(next === 'auto' ? '자동 번역 모드' : '수동 번역 모드 — 메시지별 [▶ 번역] 버튼', 'info');
+      reconcile();
+      Widget.refresh();
+      if (UI._shadow) {
+        var sel = UI._shadow.querySelector('[data-f="translateMode"]');
+        if (sel) sel.value = next;
+      }
     },
     refresh: function () {
       var sh = Widget._shadow;
       if (!sh || !Widget._host || !Widget._host.isConnected) return;
       var go = sh.querySelector('.go'), lbl = sh.querySelector('.lbl'), badge = sh.querySelector('.badge');
+      var modeBtn = sh.querySelector('[data-act="mode"]');
+      if (modeBtn) modeBtn.textContent = (cfg.translateMode === 'auto') ? '자동' : '수동';
       if (!cfg.enabled) {
         lbl.textContent = '⏸ 꺼짐';
         go.setAttribute('data-tone', 'off');
@@ -2815,7 +2912,7 @@
       }
       var s = Queue.stats();
       var n = s.pending + s.inflight;
-      lbl.textContent = '▶ 번역';
+      lbl.textContent = '⚡ 전체 번역';
       go.setAttribute('data-tone', n > 0 ? 'busy' : 'idle');
       badge.hidden = n === 0;
       badge.textContent = String(n);
@@ -3097,6 +3194,9 @@
   // path left rev changes invisible for mounted, already-done messages.
   function glossaryRecheck(item, ch, key, hit) {
     if (hit.gv === Glossary.rev()) return;
+    // 수동 모드에서는 스크립트가 절대 스스로 API를 부르지 않는다 —
+    // 용어집 rev 조건부 재번역은 자동 모드 전용이다(v0.4.0 한계, 문서화됨).
+    if (cfg.translateMode !== 'auto') return;
     var newMatches = Glossary.match(item.text).map(function (m) { return m.en; }).sort();
     var oldMatches = (hit.mt || []).slice().sort();
     if (JSON.stringify(newMatches) !== JSON.stringify(oldMatches)) {
@@ -3132,9 +3232,71 @@
     return true;
   }
 
+  // 메시지별 [▶ 번역] 버튼 클릭 처리(v0.4.0). 블록은 msgId/hash만 들고
+  // 있으므로 여기서 DOM으로부터 item을 다시 추출한다 — 가상 리스트가
+  // 노드를 재마운트했더라도 항상 "지금 화면에 있는 그 메시지"를 집는다.
+  function manualTranslateOne(msgId) {
+    if (!cfg || !cfg.enabled) return;
+    if (!Api.configured()) { UI.promptForKey(); return; }
+    msgId = String(msgId);
+
+    var item = null, anchor = null, node = null;
+    var embedAt = msgId.indexOf('-embed-');
+    if (embedAt !== -1) {
+      var accNode = document.getElementById('message-accessories-' + msgId.slice(0, embedAt));
+      if (!accNode) return;
+      // 인덱스가 아니라 msgId로 찾는다: fromAccessories는 본문이 빈
+      // article을 건너뛰므로 배열 인덱스가 -embed-N과 어긋날 수 있다.
+      var items = Extract.fromAccessories(accNode);
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].msgId === msgId) { item = items[i]; break; }
+      }
+      if (!item) return;
+      anchor = item.anchorEl || accNode;
+    } else {
+      node = document.getElementById('message-content-' + msgId);
+      if (!node) return;
+      item = Extract.fromContentNode(node);
+      if (!item) return;
+      anchor = node;
+    }
+
+    var sk = Extract.shouldSkip(item);
+    if (sk.skip) {
+      Render.remove(msgId);
+      if (node) node.setAttribute('data-dcxlt-skip', sk.reason);
+      return;
+    }
+
+    var ch = Router.currentChannel();
+    item.channelId = ch;
+
+    var key = TCache.key(msgId, item.hash);
+    var hit = TCache.get(key);
+    if (hit) {
+      Render.upsert(anchor, msgId, 'done', Object.assign({}, hit, { hash: item.hash }));
+      History.recordFromCache(item, ch, hit);
+      return;
+    }
+    if (historyRestore(anchor, msgId, item, ch)) return;
+
+    // 더블클릭 멱등: 이미 큐/인플라이트/이분할 대기에 있으면 재enqueue 금지.
+    if (Queue.has(msgId, item.hash)) {
+      Render.upsert(anchor, msgId, 'loading', { hash: item.hash });
+      return;
+    }
+
+    Render.upsert(anchor, msgId, 'loading', { hash: item.hash });
+    Queue.enqueue(item, 0);   // 사용자가 명시적으로 누른 것 → 라이브와 동급
+    var waitMs = (State.queue.pausedUntil || 0) - Util.now();
+    if (waitMs > 0) Render.statusChip('대기 중 ' + Math.ceil(waitMs / 1000) + '초', 'warn');
+  }
+
   function decidePriority(item, isNewlyMounted, ch) {
     if (cfg.perChannelOff.indexOf(ch) !== -1) return null;
-    if (!cfg.autoTranslate) return null;
+    // v0.4.0: 수동 모드에서는 자동 큐잉이 전부 꺼진다 — 라이브 경로도,
+    // 뷰포트 백필(dwell + 분당 예산)도. backfillMode는 손대지 않는다.
+    if (cfg.translateMode !== 'auto') return null;
     var scroller = State.detect.scroller;
     var nearBottom = true;
     if (scroller) nearBottom = (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) < 200;
@@ -3152,11 +3314,13 @@
         var anchorEl = item.anchorEl || accNode;
         var existing = Render.blockFor(item.msgId);
         if (existing && existing.dataset.dcxltHash === item.hash) {
-          // Same guard as the message path below: a FAILED embed keeps its
-          // error block for the manual retry button — auto-requeueing it
-          // here would clear the failed entry and retry forever.
-          if (existing.dataset.state !== 'error') return;
-          if (State.queue.failed.has(item.msgId)) return;
+          var est = existing.dataset.state;
+          if (est === 'manual') {
+            // 수동 대기 블록: 수동 모드면 여기서 끝. 자동으로 바뀌었다면
+            // 아래로 내려가 정상 큐잉되어야 한다(안 그러면 버튼이 남는다).
+            if (cfg.translateMode !== 'auto') return;
+          } else if (est !== 'error') return;
+          else if (State.queue.failed.has(item.msgId)) return;
         }
         var sk = Extract.shouldSkip(item);
         if (sk.skip) { Render.remove(item.msgId); return; }
@@ -3169,6 +3333,11 @@
         }
         if (Queue.has(item.msgId, item.hash)) return;
         if (historyRestore(anchorEl, item.msgId, item, ch)) return;
+        if (cfg.translateMode !== 'auto') {
+          if (cfg.perChannelOff.indexOf(ch) === -1) Render.upsert(anchorEl, item.msgId, 'manual', { hash: item.hash });
+          else Render.remove(item.msgId);
+          return;
+        }
         Render.upsert(anchorEl, item.msgId, 'loading', { hash: item.hash });
         item.channelId = ch;
         Queue.enqueue(item, 1);
@@ -3215,6 +3384,11 @@
           // (stale render, e.g. after a cache wipe) falls through to the
           // normal path below and recovers on its own.
           if (State.queue.failed.has(msgId)) return;
+        } else if (existing.dataset.state === 'manual') {
+          // 수동 대기 블록(v0.4.0). 수동 모드에서는 사용자가 버튼을 누를
+          // 때까지 아무 일도 하지 않는다. 자동 모드로 바뀌었다면 여기서
+          // return하면 안 된다 — 그러면 모드를 바꿔도 버튼이 영원히 남는다.
+          if (cfg.translateMode !== 'auto') { resolved.add(msgId); return; }
         } else {
           // Same content already rendered — but a glossary rev change must
           // still be honored here: this is the only moment a mounted,
@@ -3250,6 +3424,18 @@
       // 캐시 미스 → 영구 기록에서 복원 시도. 모델 변경/LRU 축출/
       // 새로고침으로 TCache가 비어도 여기서 즉시 되살아난다.
       if (historyRestore(node, msgId, item, ch)) { resolved.add(msgId); return; }
+      // 수동 모드(v0.4.0 기본): 스크립트가 스스로 API 작업을 시작하지
+      // 않는다. 캐시/기록 히트는 위에서 이미 공짜로 렌더됐고, 여기까지
+      // 내려온 것은 "번역된 적 없는 메시지"뿐이다 → 버튼만 심는다.
+      if (cfg.translateMode !== 'auto') {
+        resolved.add(msgId);
+        if (cfg.perChannelOff.indexOf(ch) === -1) {
+          Render.upsert(node, msgId, 'manual', { hash: item.hash });
+        } else {
+          Render.remove(msgId);
+        }
+        return;
+      }
       if (existing && existing.dataset.dcxltHash !== item.hash) {
         Render.upsert(node, msgId, 'loading', { hash: item.hash });
       }
@@ -3353,7 +3539,7 @@
         State.ready = true;
         if (cfg.debug) {
           window.__DCXLT__ = {
-            C: C, cfg: cfg, State: State, Glossary: Glossary, Queue: Queue, Detect: Detect,
+            C: C, DEFAULTS: DEFAULTS, cfg: cfg, State: State, Glossary: Glossary, Queue: Queue, Detect: Detect,
             Extract: Extract, Render: Render, Api: Api, reconcile: reconcile, Store: Store,
             Router: Router, Viewport: Viewport, UI: UI, MockApi: MockApi, Util: Util, TCache: TCache,
             History: History, HistoryUI: HistoryUI, Widget: Widget

@@ -54,7 +54,7 @@
     targetLang: 'ko', targetLangName: '한국어',
     glossaryUrl: 'https://example.invalid/glossary.json', glossaryAutoRefresh: false,
     glossaryStrategy: 'auto', glossaryAudit: true,
-    cacheTtl: '1h', translateEmbeds: true, backfillMode: 'viewport', contextMessages: 3,
+    cacheTtl: '1h', translateEmbeds: true, backfillMode: 'viewport', contextMessages: 3, translateMode: 'auto',
     showOriginal: true, hotkeyToggle: 'Alt+KeyT', hotkeyTranslateView: 'Alt+Shift+KeyT', hotkeyHistory: 'Alt+KeyH', perChannelOff: [],
     showWidget: true,
     fontScale: 0.875, debug: true, mockApi: 'ok',
@@ -234,7 +234,7 @@
   var msgIdCounter = 1;
   function freshId() { return '30000000000' + String(msgIdCounter++).padStart(7, '0'); }
 
-  // ---- 48 scenarios ----------------------------------------------------------
+  // ---- 54 scenarios ----------------------------------------------------------
   var scenarios = [];
 
   function scenario(name, fn) { scenarios.push({ name: name, fn: fn }); }
@@ -1259,7 +1259,7 @@
 
     var wsh = widgetShadow();
     assertTrue(!!wsh, '#dcxlt-widget-host 그림자 루트가 있어야 함');
-    assertEq(wsh.querySelector('.lbl').textContent, '▶ 번역', '기본 라벨');
+    assertEq(wsh.querySelector('.lbl').textContent, '⚡ 전체 번역', '기본 라벨');
     wsh.querySelector('[data-act="go"]').click();
     var okB = await wait(function () { return ids.every(function (x) { var b = blockEl(x); return b && b.dataset.state === 'done'; }); }, 10000);
     assertTrue(okB, '위젯 버튼으로 화면의 메시지가 번역되어야 함');
@@ -1271,7 +1271,7 @@
     assertEq(wsh.querySelector('.go').getAttribute('data-tone'), 'off', '비활성 톤');
     wsh.querySelector('[data-act="go"]').click();
     assertEq(D.cfg.enabled, true, '꺼짐 상태에서 클릭하면 다시 켜져야 함');
-    assertEq(wsh.querySelector('.lbl').textContent, '▶ 번역', '재활성 후 라벨 복구');
+    assertEq(wsh.querySelector('.lbl').textContent, '⚡ 전체 번역', '재활성 후 라벨 복구');
 
     // --- (D) showWidget=false 로 숨김 ---
     D.Store.saveSettings({ showWidget: false });
@@ -1427,6 +1427,309 @@
     await sleep(400);
     var reopened = shadow.querySelector('[data-f="apiKey"]');
     assertEq(reopened.value, '', '재오픈 후 400ms 뒤에는 입력칸이 비어 있어야 함');
+  });
+
+  scenario('49. 수동 모드가 제품 기본값 + 마운트만으로는 API 0건 (백필 포함)', async function () {
+    var D = DX();
+    // (A) 하네스 BASE_SETTINGS는 auto로 고정돼 있으므로, 제품 기본값 자체는
+    // DEFAULTS/Store.migrate로 직접 확인한다.
+    assertTrue(!!D.DEFAULTS, '__DCXLT__에 DEFAULTS가 노출되어야 함');
+    assertEq(D.DEFAULTS.translateMode, 'manual', '제품 기본 모드는 manual이어야 함');
+    assertEq(D.Store.migrate(null).translateMode, 'manual', '저장값이 없으면 manual');
+    assertEq(D.Store.migrate({ schema: 1, enabled: true, autoTranslate: true }).translateMode, 'manual',
+      'translateMode 키가 없는 v0.3.x 설정은 manual로 마이그레이션되어야 함');
+    assertEq(D.Store.migrate({ translateMode: 'auto' }).translateMode, 'auto', 'auto는 보존되어야 함');
+    assertEq(D.Store.migrate({ translateMode: 'zzz' }).translateMode, 'manual', '알 수 없는 값은 manual로');
+
+    // (B) 수동 모드: 메시지가 마운트돼도 API 호출 0건
+    resetState({ translateMode: 'manual' });
+    var calls = 0;
+    var origHandle = D.MockApi.handle;
+    D.MockApi.handle = function () { calls++; return origHandle.apply(D.MockApi, arguments); };
+    try {
+      var reqsBefore = D.State.stats.reqs;
+      var ids = [freshId(), freshId(), freshId()];
+      ids.forEach(function (id, i) { addMessage({ msgId: id, text: 'manual mode message ' + i }); });
+      forceReconcile();
+      await sleep(800);
+      assertEq(calls, 0, '수동 모드에서는 마운트만으로 API 호출이 없어야 함');
+      assertEq(D.State.stats.reqs, reqsBefore, '요청 수가 늘어나면 안 됨');
+      assertEq(D.State.queue.queued.length, 0, '큐가 비어 있어야 함');
+      ids.forEach(function (id) {
+        var b = blockEl(id);
+        assertTrue(!!b, '수동 대기 블록이 있어야 함: ' + id);
+        assertEq(b.dataset.state, 'manual', 'data-state=manual 이어야 함');
+      });
+
+      // (C) 뷰포트 백필도 꺼져 있어야 한다 — dwell을 강제로 채워도 큐잉 없음
+      ids.forEach(function (id) { D.State.viewport.dwelled.add(id); });
+      forceReconcile();
+      await sleep(600);
+      assertEq(calls, 0, '수동 모드에서는 dwell(백필) 경로도 API를 부르지 않아야 함');
+      assertEq(blockEl(ids[0]).dataset.state, 'manual', '여전히 수동 대기 상태여야 함');
+    } finally {
+      D.MockApi.handle = origHandle;
+    }
+  });
+
+  scenario('50. 메시지별 [▶ 번역] 버튼 — 대상에만 노출 + 멱등 + 재마운트 생존', async function () {
+    resetState({ translateMode: 'manual' });
+    var idEn = freshId(), idKo = freshId(), idEmpty = freshId();
+    var liEn = addMessage({ msgId: idEn, text: 'please translate this english line' });
+    addMessage({ msgId: idKo, text: '이 메시지는 이미 한국어라 건너뛰어야 합니다' });
+    addMessage({ msgId: idEmpty, text: '...' });
+    forceReconcile();
+    await sleep(250);
+
+    var bEn = blockEl(idEn);
+    assertTrue(!!bEn, '영문 메시지에는 수동 블록이 있어야 함');
+    assertEq(bEn.dataset.state, 'manual', 'state=manual');
+    var btn = bEn.querySelector('.dcxlt-mbtn');
+    assertTrue(!!btn, '[▶ 번역] 버튼이 있어야 함');
+    assertEq(btn.hidden, false, '수동 상태에서는 버튼이 보여야 함');
+    assertEq(btn.textContent, '▶ 번역', '버튼 라벨');
+
+    assertEq(blockEl(idKo), null, '이미 한국어인 메시지에는 버튼이 없어야 함');
+    assertEq(contentEl(idKo).getAttribute('data-dcxlt-skip'), 'already-korean', 'skip 사유(already-korean)');
+    assertEq(blockEl(idEmpty), null, '번역할 내용이 없는 메시지에는 버튼이 없어야 함');
+    assertEq(contentEl(idEmpty).getAttribute('data-dcxlt-skip'), 'empty', 'skip 사유(empty)');
+
+    // 멱등: 여러 번 재조정해도 블록/버튼이 중복 생성되지 않아야 함
+    forceReconcile(); forceReconcile();
+    await sleep(150);
+    assertEq(document.querySelectorAll('.dcxlt[data-dcxlt-id="' + idEn + '"]').length, 1, '블록은 1개만 존재해야 함');
+    assertTrue(blockEl(idEn).querySelector('.dcxlt-mbtn') === btn, '버튼 노드가 재생성되지 않아야 함(멱등 주입)');
+
+    // 가상 리스트 재마운트
+    var root = chatRootEl();
+    root.removeChild(liEn);
+    forceReconcile();
+    assertEq(blockEl(idEn), null, '언마운트되면 블록도 사라져야 함');
+    root.appendChild(liEn);
+    forceReconcile();
+    var ok = await wait(function () {
+      var b = blockEl(idEn);
+      var mb = b && b.querySelector('.dcxlt-mbtn');
+      return b && b.dataset.state === 'manual' && mb && !mb.hidden;
+    }, 3000);
+    assertTrue(ok, '재마운트 후 버튼이 다시 나타나야 함');
+    assertEq(document.querySelectorAll('.dcxlt[data-dcxlt-id="' + idEn + '"]').length, 1, '재마운트 후에도 블록은 1개');
+  });
+
+  scenario('51. 버튼 클릭 → 그 메시지 1건만 번역 (요청 1건, 정확한 항목)', async function () {
+    resetState({ translateMode: 'manual' });
+    var D = DX();
+    var ids = [freshId(), freshId(), freshId()];
+    ids.forEach(function (id, i) { addMessage({ msgId: id, text: 'manual click target ' + i }); });
+    forceReconcile();
+    await sleep(250);
+    assertTrue(ids.every(function (id) { var b = blockEl(id); return b && b.dataset.state === 'manual'; }),
+      '클릭 전에는 3건 모두 수동 대기여야 함');
+
+    var sent = [];
+    var origSend = D.Queue._send;
+    D.Queue._send = function (batch) {
+      sent.push(batch.map(function (it) { return it.msgId; }));
+      return origSend.call(D.Queue, batch);
+    };
+    var reqsBefore = D.State.stats.reqs;
+    try {
+      blockEl(ids[1]).querySelector('.dcxlt-mbtn').click();
+      var ok = await wait(function () { var b = blockEl(ids[1]); return b && b.dataset.state === 'done'; }, 8000);
+      assertTrue(ok, '클릭한 메시지가 번역되어야 함');
+      assertEq(sent.length, 1, '요청은 정확히 1건이어야 함 (관측: ' + JSON.stringify(sent) + ')');
+      assertEq(sent[0].length, 1, '배치에 항목이 1개여야 함');
+      assertEq(sent[0][0], ids[1], '배치에 담긴 항목이 클릭한 바로 그 메시지여야 함');
+      assertEq(D.State.stats.reqs - reqsBefore, 1, 'API 요청 수는 정확히 1건');
+      assertTrue(blockEl(ids[1]).querySelector('.dcxlt-text').textContent.indexOf('manual click target 1') !== -1,
+        '번역문(MOCK)에 원문이 포함되어야 함');
+      assertEq(blockEl(ids[1]).querySelector('.dcxlt-mbtn').hidden, true, '번역되면 버튼은 숨겨져야 함');
+      assertEq(blockEl(ids[0]).dataset.state, 'manual', '나머지 메시지는 그대로 수동 대기여야 함');
+      assertEq(blockEl(ids[2]).dataset.state, 'manual', '나머지 메시지는 그대로 수동 대기여야 함');
+
+      // 재클릭 멱등: 캐시 히트로 처리되고 추가 요청이 없어야 함
+      blockEl(ids[1]).querySelector('.dcxlt-mbtn').click();
+      await sleep(700);
+      assertEq(sent.length, 1, '재클릭은 추가 요청을 만들지 않아야 함');
+      assertEq(blockEl(ids[1]).dataset.state, 'done', '재클릭 후에도 done 유지');
+
+      // (오케스트레이터 델타) API 키가 사후에 지워지면 버튼 클릭은
+      // UI.promptForKey()로만 이어지고 요청은 0건, 블록은 manual로 남아야
+      // 한다 — D6 "키가 사후에 지워진 경우의 안전망" 경로의 회귀 방지.
+      var noKeyCalls = 0;
+      var origHandleNoKey = D.MockApi.handle;
+      D.MockApi.handle = function () { noKeyCalls++; return origHandleNoKey.apply(D.MockApi, arguments); };
+      var savedKey = D.State.apiKey;
+      D.State.apiKey = '';
+      D.State.keyPromptShown = false;
+      try {
+        assertEq(blockEl(ids[0]).dataset.state, 'manual', '키 제거 전에는 여전히 수동 대기여야 함');
+        blockEl(ids[0]).querySelector('.dcxlt-mbtn').click();
+        await sleep(200);
+        assertEq(noKeyCalls, 0, 'API 키가 없으면 버튼을 눌러도 요청이 없어야 함');
+        assertEq(D.State.stats.reqs, reqsBefore + 1, 'API 키 없는 클릭은 요청 수를 늘리면 안 됨');
+        assertEq(blockEl(ids[0]).dataset.state, 'manual', '키 없이 클릭해도 data-state가 manual로 남아 있어야 함');
+        assertTrue(!!document.getElementById('dcxlt-settings-host'), 'UI.promptForKey()가 설정 패널을 열어야 함');
+      } finally {
+        D.MockApi.handle = origHandleNoKey;
+        D.State.apiKey = savedKey;
+      }
+    } finally {
+      D.Queue._send = origSend;
+    }
+  });
+
+  scenario('52. 수동 모드에서 캐시/기록 히트는 클릭 없이 렌더 + 기록 백필 (API 0건)', async function () {
+    resetState({ translateMode: 'manual' });
+    var D = DX();
+    var id = freshId();
+    addMessage({ msgId: id, text: 'cache hit without click message' });
+    forceReconcile();
+    var okBtn = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'manual'; }, 3000);
+    assertTrue(okBtn, '먼저 수동 버튼이 떠야 함');
+    blockEl(id).querySelector('.dcxlt-mbtn').click();
+    var ok = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'done'; }, 8000);
+    assertTrue(ok, '클릭으로 번역이 완료되어야 함');
+
+    var item = D.Extract.fromContentNode(contentEl(id));
+    var tcEntry = D.TCache.get(D.TCache.key(id, item.hash));
+    assertTrue(!!tcEntry, 'TCache에 항목이 있어야 함');
+
+    // (A) TCache 히트 — 기록을 비우고 블록을 지워도 재조정만으로 렌더 + 기록 백필
+    D.History.clear();
+    D.Render.remove(id);
+    assertEq(blockEl(id), null, '블록이 제거된 상태여야 함');
+    var reqsBefore = D.State.stats.reqs;
+    forceReconcile();
+    var okA = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'done'; }, 3000);
+    assertTrue(okA, '수동 모드에서도 캐시 히트는 클릭 없이 done으로 렌더되어야 함');
+    assertEq(D.State.stats.reqs, reqsBefore, '캐시 히트에는 API 호출이 없어야 함');
+    var okH = await wait(function () { return D.History.all().length === 1; }, 2000);
+    assertTrue(okH, '캐시 히트 렌더가 기록에 백필되어야 함 (관측: ' + D.History.all().length + ')');
+    assertEq(D.History.get(id, item.hash).tt, tcEntry.ts, '기록의 tt는 원래 번역 시각을 유지해야 함');
+
+    // (B) TCache 미스 + 기록 히트 — historyRestore도 클릭 없이 동작해야 함
+    D.TCache.clear();
+    D.Render.remove(id);
+    var reqsBefore2 = D.State.stats.reqs;
+    forceReconcile();
+    var okB = await wait(function () { var b = blockEl(id); return b && b.dataset.state === 'done'; }, 3000);
+    assertTrue(okB, '수동 모드에서도 기록 복원은 클릭 없이 done으로 렌더되어야 함');
+    assertEq(D.State.stats.reqs, reqsBefore2, '기록 복원에도 API 호출이 없어야 함');
+  });
+
+  scenario('53. 위젯 [⚡ 전체 번역] — 마운트된 대상 전부 일괄 큐잉, 이후 도착분은 수동 유지', async function () {
+    resetState({ translateMode: 'manual' });
+    var D = DX();
+    var enIds = [freshId(), freshId(), freshId()];
+    var koId = freshId();
+    enIds.forEach(function (id, i) { addMessage({ msgId: id, text: 'translate all target ' + i }); });
+    addMessage({ msgId: koId, text: '이미 한국어인 메시지라 전체 번역에서도 제외됩니다' });
+    forceReconcile();
+    await sleep(300);
+    var reqsBefore = D.State.stats.reqs;
+    assertTrue(enIds.every(function (id) { var b = blockEl(id); return b && b.dataset.state === 'manual'; }),
+      '클릭 전에는 전부 수동 대기여야 함');
+
+    var wsh = widgetShadow();
+    assertTrue(!!wsh, '#dcxlt-widget-host 그림자 루트가 있어야 함');
+    assertEq(wsh.querySelector('.lbl').textContent, '⚡ 전체 번역', '위젯 라벨이 전체 번역으로 바뀌어야 함');
+
+    wsh.querySelector('[data-act="go"]').click();
+    var badge = wsh.querySelector('.badge');
+    assertEq(badge.hidden, false, '클릭 직후 배지가 보여야 함');
+    assertTrue(Number(badge.textContent) >= 3, '배지에 대기 건수가 표시되어야 함 (관측: ' + badge.textContent + ')');
+
+    var ok = await wait(function () {
+      return enIds.every(function (id) { var b = blockEl(id); return b && b.dataset.state === 'done'; });
+    }, 15000);
+    assertTrue(ok, '전체 번역으로 대상 메시지가 전부 번역되어야 함');
+    assertEq(blockEl(koId), null, 'skip 대상은 전체 번역에서도 제외되어야 함');
+    var okBadge = await wait(function () { D.Widget.refresh(); return wsh.querySelector('.badge').hidden === true; }, 3000);
+    assertTrue(okBadge, '전부 끝나면 배지가 숨겨져야 함');
+
+    // 전체 번역은 1회성 — 이후 도착분은 다시 수동
+    var reqsAfterAll = D.State.stats.reqs;
+    assertTrue(reqsAfterAll > reqsBefore, '전체 번역은 API를 호출해야 함');
+    var lateId = freshId();
+    addMessage({ msgId: lateId, text: 'arrived after translate all click' });
+    forceReconcile();
+    await sleep(900);
+    var lb = blockEl(lateId);
+    assertTrue(!!lb && lb.dataset.state === 'manual', '전체 번역 이후 도착분은 다시 수동 대기여야 함');
+    assertEq(D.State.stats.reqs, reqsAfterAll, '이후 도착분이 자동 번역되면 안 됨');
+
+    // 임베드도 전체 번역 대상
+    if (window.Fixtures && typeof window.Fixtures.mkEmbed === 'function') {
+      var eid = freshId();
+      addMessage({
+        msgId: eid, text: '본문은 이미 한국어라 건너뜁니다',
+        embedHtml: window.Fixtures.mkEmbed({ title: 'Notice', description: 'translate all embed body' })
+      });
+      forceReconcile();
+      await sleep(300);
+      var eb = D.Render.blockFor(eid + '-embed-0');
+      assertTrue(!!eb && eb.dataset.state === 'manual', '임베드에도 수동 버튼이 붙어야 함');
+      wsh.querySelector('[data-act="go"]').click();
+      var okE = await wait(function () {
+        var b = D.Render.blockFor(eid + '-embed-0');
+        return b && b.dataset.state === 'done';
+      }, 10000);
+      assertTrue(okE, '전체 번역이 임베드도 포함해야 함');
+    }
+  });
+
+  scenario('54. 모드 전환 — 패널 저장/영속 + 위젯 칩 토글 + 동작 전환', async function () {
+    resetState({ translateMode: 'manual' });
+    var D = DX();
+
+    // (A) 패널에서 수동 → 자동 저장 + GM 저장소 영속
+    D.UI.openSettings('일반');
+    var shadow = document.getElementById('dcxlt-settings-host').shadowRoot;
+    D.UI._fillFromCfg(shadow);   // 이전 시나리오가 남긴 패널 상태 제거
+    var sel = shadow.querySelector('[data-f="translateMode"]');
+    assertTrue(!!sel, '설정 패널에 번역 모드 셀렉트가 있어야 함');
+    assertEq(sel.value, 'manual', '패널이 현재 모드(manual)를 보여줘야 함');
+    sel.value = 'auto';
+    shadow.querySelector('[data-act="save-general"]').click();
+    assertEq(D.Store.getSettings().translateMode, 'auto', '저장 후 cfg가 auto여야 함');
+    assertEq(window.GM_getValue('dcxlt.settings.v1', {}).translateMode, 'auto', 'GM 저장소에 영속되어야 함');
+    D.UI.closeSettings();
+
+    // (B) 자동 모드에서는 클릭 없이 번역
+    var autoId = freshId();
+    addMessage({ msgId: autoId, text: 'auto mode should translate without any click' });
+    forceReconcile();
+    var okAuto = await wait(function () { var b = blockEl(autoId); return b && b.dataset.state === 'done'; }, 8000);
+    assertTrue(okAuto, '자동 모드에서는 버튼 클릭 없이 번역되어야 함');
+
+    // (C) 위젯 칩으로 자동 → 수동
+    var wsh = widgetShadow();
+    var modeBtn = wsh.querySelector('[data-act="mode"]');
+    assertTrue(!!modeBtn, '위젯에 모드 칩이 있어야 함');
+    assertEq(modeBtn.textContent, '자동', '칩이 현재 모드를 표시해야 함');
+    modeBtn.click();
+    assertEq(D.Store.getSettings().translateMode, 'manual', '칩 클릭으로 수동이 되어야 함');
+    assertEq(modeBtn.textContent, '수동', '칩 라벨이 갱신되어야 함');
+    var manualId = freshId();
+    var reqsBefore = D.State.stats.reqs;
+    addMessage({ msgId: manualId, text: 'added after switching back to manual mode' });
+    forceReconcile();
+    await sleep(900);
+    var mb = blockEl(manualId);
+    assertTrue(!!mb && mb.dataset.state === 'manual', '수동으로 되돌리면 새 메시지는 버튼만 있어야 함');
+    assertEq(D.State.stats.reqs, reqsBefore, '수동 전환 후에는 자동 번역이 없어야 함');
+
+    // (D) 수동 → 자동 전환 시, 이미 버튼이 붙어 있던 메시지도 번역되어야 함
+    modeBtn.click();
+    assertEq(D.Store.getSettings().translateMode, 'auto', '다시 자동 모드');
+    var okD = await wait(function () { var b = blockEl(manualId); return b && b.dataset.state === 'done'; }, 8000);
+    assertTrue(okD, '자동 전환 시 대기 중이던 수동 블록도 번역되어야 함(previousSeen 초기화 + fast-path 통과)');
+
+    // (E) 재오픈한 패널이 현재 모드를 반영해야 함(저장 시 조용히 되돌아가면 안 됨)
+    D.UI.openSettings('일반');
+    assertEq(shadow.querySelector('[data-f="translateMode"]').value, 'auto', '재오픈한 패널이 현재 모드를 보여줘야 함');
+    D.UI.closeSettings();
   });
 
   // ---- runner ----------------------------------------------------------

@@ -160,7 +160,7 @@ const C = {
 const DEFAULTS = {
   schema: 1,
   enabled: true,                 // 마스터 스위치
-  autoTranslate: true,           // false면 수동 트리거만
+  translateMode: 'manual',       // 'manual'(기본, 메시지별 버튼) | 'auto'(v0.3.x 동작)
   model: 'claude-opus-5',
   effort: 'low',                 // low|medium|high
   maxTokens: 4000,
@@ -276,6 +276,7 @@ Util.now() -> number
 ### 4.2 `Store`
 ```js
 Store.load()                             // 설정+캐시+용어집 로드, 스키마 마이그레이션
+Store.migrate(stored) -> cfg             // 순수 함수, v0.4.0 translateMode 정규화 (Store.load()가 내부에서 호출)
 Store.get(key, def) / Store.set(key, val)
 Store.getSettings() -> cfg
 Store.saveSettings(patch)                // 변경 필드에 따라 부작용 트리거(모델 변경→캐시워밍 리셋 등)
@@ -339,7 +340,8 @@ Detect.reportDiagnostics() -> string      // 클립보드용 텍스트(키 마�
 Render.injectStyles()
 Render.blockFor(msgId) -> Element|null
 Render.upsert(contentNode, msgId, state, payload)
-//   state: 'loading' | 'done' | 'error' | 'skipped-manual'
+//   state: 'loading' | 'done' | 'error' | 'manual'    (v0.4.0: 'manual'이 수동 대기/[▶ 번역] 버튼 상태.
+//   죽은 코드였던 구 'skipped-manual' 분기를 교체했다)
 Render.remove(msgId)
 Render.setGlobalHidden(bool)              // documentElement에 dcxlt-hidden 클래스
 Render.statusChip(text, tone)             // 우하단 상태 칩 (레이트리밋/오류/진행중)
@@ -350,9 +352,10 @@ Render.markAuditWarning(el, missingTerms)
 주입 위치: `contentNode.insertAdjacentElement('afterend', block)`.
 **적응형 폴백**: 동일 `msgId`의 블록이 5초 내 3회 이상 외부 요인으로 제거되면(React 리렌더 추정) 해당 세션의 삽입 전략을 `message-accessories-<id>` 내부 append로 전환하고 진단에 기록한다.
 
-DOM 구조 (하나의 블록):
+DOM 구조 (하나의 블록 — `mbtn`은 v0.4.0 신설, 상태에 따라 `hidden`만 토글):
 ```html
-<div class="dcxlt" data-dcxlt-id="123..." data-dcxlt-hash="a1b2" data-state="done">
+<div class="dcxlt" data-dcxlt-id="123..." data-dcxlt-hash="a1b2" data-state="manual">
+  <button class="dcxlt-mbtn" data-act="manual-translate" hidden>▶ 번역</button>
   <span class="dcxlt-text">번역문</span>
   <span class="dcxlt-tools">
     <button class="dcxlt-retry" title="재시도">↻</button>
@@ -367,6 +370,8 @@ CSS (GM_addStyle, 모두 `.dcxlt` 접두사, 디스코드 CSS 변수 폴백 포�
   color:var(--text-muted,#949ba4);font-size:.875em;line-height:1.35;white-space:pre-wrap;word-break:break-word}
 .dcxlt[data-state="loading"] .dcxlt-text{opacity:.55;font-style:italic}
 .dcxlt[data-state="error"]{border-left-color:var(--status-danger,#f23f43)}
+.dcxlt[data-state="manual"]{border-left-color:transparent;padding-left:0}   /* v0.4.0: 버튼만 있을 땐 시각 무게를 낮춘다 */
+.dcxlt-mbtn{cursor:pointer;opacity:.7}.dcxlt-mbtn:hover{opacity:1}
 .dcxlt-spoiler{filter:blur(6px);cursor:pointer}.dcxlt-spoiler.revealed{filter:none}
 .dcxlt-hidden .dcxlt{display:none!important}
 .dcxlt-hide-original [id^="message-content-"]{display:none}   /* showOriginal:false 일 때 */
@@ -403,7 +408,8 @@ Api.recordUsage(usage)                    // stats + 캐시 히트 여부(cache_
 Viewport.attach(scroller)                 // IntersectionObserver(root=scroller, threshold=0.01)
 Viewport.onEnter(el) / onLeave(el)        // dwell 타이머 관리
 Viewport.budgetOk() -> boolean            // 분당 BACKFILL_PER_MIN 토큰버킷
-Viewport.translateVisibleNow()            // 수동 트리거: dwell·예산 무시
+Viewport.translateVisibleNow()            // 위젯 "⚡ 전체 번역" 전용: dwell·예산 무시, 마운트된 콘텐츠+임베드(translateEmbeds
+                                           // 시)를 스킵아님+미번역+큐없음 기준으로 전부 priority 2 일괄 큐잉(1회성, v0.4.0)
 ```
 
 ### 4.11 `Router`
@@ -452,14 +458,16 @@ History는 `id|hash`만으로 키가 잡혀 모델/언어와 무관하게 살아
 히트로 렌더된(v0.3.0 이전에 이미 번역된 포함) 메시지는 기록에 빠졌다 — 세 히트 경로 모두에서
 `History.recordFromCache`를 호출해 소급 적재한다(§10 시나리오 47).
 
-### 4.14 `Widget` (플로팅 위젯, v0.3.0, §13b)
+### 4.14 `Widget` (플로팅 위젯, v0.3.0, §13b; 라벨/모드 칩은 v0.4.0)
 ```js
 Widget.apply()                            // showWidget:false면 unmount, 아니면 ensure
 Widget.ensure()                           // 2초 간격 setInterval — 호스트가 사라졌으면 재마운트
 Widget.mount() / Widget.unmount()
-Widget.onGo()                             // 꺼짐이면 재활성화, 켜짐이면 화면 즉시 번역(dwell/예산 무시)
-Widget.refresh()                          // 라벨/톤/배지(대기+진행중 합)
+Widget.onGo()                             // 꺼짐이면 재활성화, 켜짐이면 "⚡ 전체 번역"(dwell/예산 무시, 1회성)
+Widget.onModeToggle()                     // v0.4.0: manual<->auto 저장 + previousSeen 초기화 + reconcile + 라벨 갱신
+Widget.refresh()                          // 라벨("⚡ 전체 번역")/톤/배지(대기+진행중 합)/모드 칩 라벨("수동"|"자동")
 ```
+자동 모드에서도 위젯은 숨기지 않는다 — 백필 예산/dwell에 막혀 밀린 메시지를 즉시 밀어붙이는 유일한 수단이라 계속 유효하다.
 `#dcxlt-widget-host`(shadow DOM, `right:16px;bottom:96px;z-index:2147483000`). `reconcile()`에
 얹지 않고 독립 `setInterval(Widget.ensure, 2000)`으로 유지하는 이유: reconcile은
 `cfg.enabled===false`면 즉시 return하는데, 위젯은 바로 그 순간 `⏸ 꺼짐`을 보여줘야 한다. 버튼은
@@ -581,8 +589,12 @@ FUNCTION reconcile():
       IF !item: continue
 
       existing = node.nextElementSibling matching '.dcxlt'
-      IF existing AND existing.dataset.dcxltHash === item.hash AND existing.dataset.state !== 'error':
-          continue                              # 이미 최신 → 아무것도 안 함
+      IF existing AND existing.dataset.dcxltHash === item.hash:
+          IF existing.dataset.state === 'manual':
+              IF cfg.translateMode !== 'auto': continue     # 수동 대기 유지
+              # else: 자동으로 전환됨 → 아래로 내려가 정상 큐잉 (버튼이 영구 잔류하는 것 방지, v0.4.0 R1)
+          ELSE IF existing.dataset.state !== 'error':
+              continue                          # 이미 최신 → 아무것도 안 함
 
       # 스킵 판정 (API 호출 없음)
       sk = Extract.shouldSkip(item)
@@ -599,12 +611,20 @@ FUNCTION reconcile():
               Queue.enqueue(item, 2)            # 조용한 갱신
           continue
 
-      # 미번역
+      # 미번역 (캐시 미스 → 영구 기록에서 폴백 렌더 시도, §4.13)
       IF Queue.has(msgId, item.hash): continue
+      IF historyRestore(node, msgId, item, ch): continue
+
+      # v0.4.0: 수동 모드에서는 여기까지 내려온 것 = "번역된 적 없는 메시지"뿐이다.
+      # 캐시/기록 히트는 위에서 이미 클릭 없이 렌더됐으므로, 남은 건 버튼만 심는다.
+      IF cfg.translateMode !== 'auto':
+          Render.upsert(node, msgId, 'manual', null)
+          continue
+
       IF existing AND existing.dataset.dcxltHash !== item.hash:
           Render.upsert(node, msgId, 'loading', null)   # 편집됨 → 로딩으로 전환
 
-      priority = decidePriority(node)           # §5.4
+      priority = decidePriority(node)           # §5.4 — auto 모드에서만 null이 아닌 값을 반환
       IF priority !== null:
           Render.upsert(node, msgId, 'loading', null)
           Queue.enqueue({...item, channelId: ch}, priority)
@@ -670,13 +690,27 @@ classify 판정 기준 (클래스 해시 비의존 순서):
 
 ```
 IF 채널이 cfg.perChannelOff에 있음: return null
-IF !cfg.autoTranslate: return null                       # 수동 트리거만
+IF cfg.translateMode !== 'auto': return null              # v0.4.0: 수동 모드 = 자동 큐잉 전면 차단(라이브+백필 둘 다)
 IF 메시지가 현재 뷰포트 하단 근처(스크롤이 바닥에서 200px 이내)이고 마운트 직후: return 0   # 라이브
 IF cfg.backfillMode === 'off': return null
 IF cfg.backfillMode === 'manual': return null
 IF Viewport가 이 노드를 dwell(400ms) 충족으로 표시했고 Viewport.budgetOk(): return 1
 return null                                              # 아직 조건 미충족 → 다음 스윕에서 재평가
 ```
+
+### 모드별 동작 표 (v0.4.0)
+
+| 동작 | manual (기본) | auto |
+|---|---|---|
+| 마운트 스캔 / skip 마킹 | O | O |
+| TCache 히트 렌더 | O (클릭 불필요, API 0건) | O |
+| History 복원 렌더 | O (클릭 불필요, API 0건) | O |
+| `History.recordFromCache` 백필 | O | O |
+| 도착 즉시 자동 번역(priority 0) | X | O |
+| 뷰포트 백필(dwell + 분당 예산) | X | `backfillMode`에 따름 |
+| 용어집 rev 조건부 재번역 | X | O |
+| 메시지별 `[▶ 번역]` 버튼 | O | 전환 잔여분에만(신규 생성 없음) |
+| 위젯 `⚡ 전체 번역` | O | O |
 
 ---
 
@@ -1091,6 +1125,12 @@ FUNCTION parseResponse(json):
 | 46 | 스크롤업 중 도착한 메시지 + 위젯 즉시 번역 (v0.3.0) | (A) `previousSeen`/`resolved` 분리 회귀 검증: 스크롤업 중 마운트 → 하단 복귀 시 dwell/예산 없이 즉시 번역(priority 0). (B) 위젯 `▶ 번역`이 backfill 제약 무시하고 화면 메시지 번역. (C) 꺼짐 시 `⏸ 꺼짐` 표시, 클릭 재활성화. (D) `showWidget` 설정으로 위젯 표시/숨김. (E) Alt+T 재활성화가 1500ms 인터벌을 기다리지 않고 즉시 `reconcile()` |
 | 47 | 캐시 히트 재렌더 시 기록 백필 (v0.3.1) | 신규 번역 2건 커밋 → `History.clear()`(v0.3.0 이전 상태 시뮬레이션) → 블록 제거 후 재조정하면 TCache 히트 경로에서 `History.recordFromCache`가 API 재호출 없이 원래 번역 시각(`tt`)으로 소급 적재, 재조정해도 중복 적재 없음(멱등), 임베드 히트도 동일하게 `k:'embed'`/`au:''`로 백필 |
 | 48 | 브라우저 자동완성 값이 API 키로 저장/전송되지 않음 (v0.3.1) | API 키 입력은 `type="text"`+`-webkit-text-security:disc`로 자동완성 차단, 형식이 `sk-ant-`로 시작하지 않는 typed 값은 연결 테스트를 `Api.testConnection` 호출 없이 형식 오류로 거부하고 저장도 거부(`State.apiKey` 불변, 안내 토스트), 올바른 형식은 정상 저장, 패널 재오픈 시 300ms 뒤 입력칸 재클리어 |
+| 49 | 수동 모드가 제품 기본값 + 마운트만으로는 API 0건 (v0.4.0) | `window.__DCXLT__.DEFAULTS.translateMode`와 `Store.migrate(null)`이 `'manual'`, `translateMode` 키 없는 v0.3.x 설정도 `'manual'`로 마이그레이션, 알 수 없는 값도 `'manual'`로 정규화. 수동 모드에서는 메시지 마운트·dwell 강제 채움 어느 경로로도 API 호출 0건, 큐 비어 있음 |
+| 50 | 메시지별 `[▶ 번역]` 버튼 — 대상에만 노출 + 멱등 + 재마운트 생존 (v0.4.0) | skip 대상(한국어/빈 메시지)에는 블록 자체가 없음, 반복 재조정에도 버튼 노드 재생성 없음(멱등 주입), 가상 리스트 언마운트/재마운트 후 버튼이 다시 나타남 |
+| 51 | 버튼 클릭 → 그 메시지 1건만 번역 (v0.4.0) | 클릭한 메시지만 우선순위 0으로 큐잉(요청 1건, 배치 크기 1), 나머지는 수동 대기 유지, 재클릭은 캐시 히트로 추가 요청 없음. API 키가 사후에 지워진 상태의 클릭은 `UI.promptForKey()`만 호출하고 요청 0건, 블록은 `manual` 유지 |
+| 52 | 수동 모드에서 캐시/기록 히트는 클릭 없이 렌더 + 기록 백필 (v0.4.0) | TCache 히트·History 히트 모두 버튼 클릭 없이 `done`으로 렌더(API 0건), `History.recordFromCache` 백필도 그대로 동작 |
+| 53 | 위젯 `⚡ 전체 번역` — 일괄 큐잉 + 1회성 (v0.4.0) | 마운트된 스킵아님·미번역 대상 전부(임베드 포함) priority 2로 일괄 큐잉, 배지에 대기 건수 표시, 완료 후 배지 숨김. 클릭 이후 새로 도착한 메시지는 다시 수동 대기(자동 모드로 전환되는 것이 아님) |
+| 54 | 모드 전환 — 패널 저장/영속 + 위젯 칩 토글 + 동작 전환 (v0.4.0) | 설정 패널 저장이 GM 저장소에 영속, 위젯 모드 칩(`수동`/`자동`)으로 왕복 전환, 전환 시 대기 중이던 `manual` 블록이 즉시 번역됨(fast-path `manual` 예외 + `previousSeen` 초기화 회귀 방지, R1), 패널 재오픈이 최신 모드 반영 |
 
 ---
 

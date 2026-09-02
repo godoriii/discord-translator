@@ -1,6 +1,6 @@
 # HANDOFF — 다른 기기에서 이어서 작업하기
 
-> 최종 갱신: 2026-09-01 (집 컴퓨터 세션). v0.3.1 — 번역 기록 캐시 히트 백필(TCache 히트로 렌더된 메시지가 기록에 안 잡히던 "0 / 0건" 버그), 브라우저 자동완성 API 키 오염 방지. 시나리오 47-48 추가, 하네스 49/49 클린 통과.
+> 최종 갱신: 2026-09-02. v0.4.0 — 메시지별 `[▶ 번역]` 버튼 + 수동 모드 기본화(기존 `autoTranslate` 은퇴, `translateMode` 신설), 위젯을 **⚡ 전체 번역**(1회성 일괄 큐잉, 임베드 포함)으로 전환. 시나리오 49-54 추가, 하네스 55/55 클린 통과.
 
 ## 이 프로젝트가 무엇인가
 Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 메시지를 Claude API로 한국어 인라인 번역하고, 사용자 용어집(`glossary.json`, WoW 공식 한국어 명칭)을 강제 적용한다. Windows/Mac 동일 스크립트 한 벌, GitHub raw URL로 자동 업데이트.
@@ -42,7 +42,7 @@ Chrome + Tampermonkey 유저스크립트. 웹 디스코드(discord.com) 채팅 �
     --enable-logging=stderr --v=0 \
     "http://127.0.0.1:8899/test/harness.html?autorun=1" 2>&1 | grep DCXLT_SUMMARY
   ```
-  `DCXLT_SUMMARY pass=49 fail=0 skipped=0 xhr=0` 이 나와야 한다 (48 시나리오 + 네트워크 어서션 = 49). (완주 후 크롬은 직접 kill)
+  `DCXLT_SUMMARY pass=55 fail=0 skipped=0 xhr=0` 이 나와야 한다 (54 시나리오 + 네트워크 어서션 = 55). (완주 후 크롬은 직접 kill)
   - 참고: `--virtual-time-budget`은 영구 setInterval과 상극이라 여전히 금지. 위처럼 실시간 타이머 + 스로틀링 비활성 플래그로 돌린다.
   - 하네스 디버그 파라미터: `&only=3,17,28`(부분 실행), `&spy=1`(큐 이벤트 `DCXLT_TRACE` 콘솔 트레이스), 완주 시 `DCXLT_RESULTS <json>` 콘솔 라인으로 시나리오별 결과 수집 가능.
 - 포그라운드 브라우저에서 보고 싶으면: `http://127.0.0.1:8899/test/harness.html` 을 **화면에 보이는 탭**으로 열고 `await __DCXLT_TEST__.runAll()`. (hidden 탭은 타이머 스로틀링 때문에 타이밍 시나리오가 가짜로 실패한다 — 이전 세션의 "백그라운드 28/34"가 그것)
@@ -105,7 +105,7 @@ TCache는 `msgId|hash|targetLang|model`로 키가 잡혀 있어 모델을 바꾸
 
 ### 플로팅 위젯 + 번역 기록 오버레이
 
-우측 하단 알약 버튼(`#dcxlt-widget-host`, `▶ 번역`/배지/`☰`/`⚙`, 꺼짐일 때 `⏸ 꺼짐`)이 항상 떠서 화면의 메시지를 스크롤·dwell·백필 예산과 무관하게 즉시 번역한다. `reconcile`이 아니라 `setInterval(Widget.ensure, 2000)`으로 독립 유지되는 이유: `reconcile`은 `cfg.enabled=false`면 즉시 return하는데, 위젯은 바로 그 순간 `⏸ 꺼짐`을 보여줘야 한다. 클릭이 포커스를 뺏지 않도록 `tabindex="-1"` + `mousedown` `preventDefault`.
+우측 하단 알약 버튼(`#dcxlt-widget-host`, v0.4.0부터 `⚡ 전체 번역`/배지/모드 칩(`수동`/`자동`)/`☰`/`⚙`, 꺼짐일 때 `⏸ 꺼짐`)이 항상 떠서 화면의 메시지를 스크롤·dwell·백필 예산과 무관하게 즉시 번역한다. `reconcile`이 아니라 `setInterval(Widget.ensure, 2000)`으로 독립 유지되는 이유: `reconcile`은 `cfg.enabled=false`면 즉시 return하는데, 위젯은 바로 그 순간 `⏸ 꺼짐`을 보여줘야 한다. 클릭이 포커스를 뺏지 않도록 `tabindex="-1"` + `mousedown` `preventDefault`.
 
 `#dcxlt-history-host`(별도 shadow host, 설정 패널의 560px 모달과 분리 — 표 형태엔 내부 스크롤 영역이 필요하고 설정 호스트를 건드리면 시나리오 42가 검증하는 shadow 구조가 흔들린다)는 날짜→채널로 그룹핑된 기록을 검색/채널 필터/복사·이동·삭제/`.txt`·`.json` 내보내기(`Blob`+`<a download>`, 하네스가 스텁할 수 있도록 `_download()`로 분리)/2단계 `기록 지우기`(`window.confirm` 미사용 — 하네스·디스코드 이벤트 루프를 막기 때문)로 보여준다. 메뉴 **번역 기록**, 단축키 **Alt+H**, 위젯 **☰**로 연다.
 
@@ -119,6 +119,42 @@ TCache는 `msgId|hash|targetLang|model`로 키가 잡혀 있어 모델을 바꾸
 
 1. **번역 기록 "0 / 0건"** — v0.3.0의 `History.append`는 `Queue._commit`(신규 번역이 API에서 도착한 순간)에서만 호출됐다. TCache 히트로 렌더된 메시지(v0.3.0 이전에 이미 번역된 메시지 포함)는 한 번도 `Queue._commit`을 거치지 않으므로 기록에 전혀 안 잡혔다 — 화면은 번역으로 가득한데 오버레이는 `0 / 0건`. **수정**: `Queue._commit`이 쓰던 엔트리 조립 로직을 `History.fromItem(item, ch, entry)`로 추출하고, `reconcile`/`reconcileEmbeds`/`Viewport.translateVisibleNow`의 TCache 히트 분기에서 `History.recordFromCache(item, ch, hit)`를 호출해 아직 기록에 없는 항목만 소급 적재한다(원래 번역 시각 `tt`는 TCache의 `ts`를 그대로 써 목록 정렬이 "방금 백필됨"으로 왜곡되지 않게 함, API 재호출 없음, 멱등). 시나리오 47.
 2. **브라우저 비밀번호 자동완성이 API 키 칸을 오염** — 설정 패널의 `<input type="password" data-f="apiKey">`가 Chrome 저장 비밀번호(디스코드 로그인 비번 등)의 자동완성 타깃이 됐다. 연결 테스트를 누르면 그 값이 `x-api-key`로 전송돼 `키 거부 (401)`가 뜨는데(정작 저장된 실 키로는 번역이 잘 됨), **더 나쁘게는** 저장 버튼을 누르면 `if (key) Store.setApiKey(key)`가 멀쩡히 동작하던 키를 그 값으로 덮어써 실사용 번역까지 401로 끊기는 함정이었다. `[data-f="customApiKey"]`도 동일 위험. **수정**: 두 입력을 `type="text"` + `-webkit-text-security:disc`(시각적 마스킹 유지, Chrome이 저장된 비밀번호를 넣지 않는 타입) + `autocomplete="off"`/무작위 `name`으로 바꾸고, 패널을 열 때마다(및 300ms 뒤 한 번 더, 비동기 자동완성 대비) 입력칸을 강제로 비운다. `Api.looksLikeAnthropicKey`(`sk-ant-` 접두사)로 저장 직전·연결 테스트 직전 형식을 검증해, 형식이 안 맞으면 저장을 거부하고 안내 토스트를 띄운 뒤 칸을 비운다(커스텀 키는 공백 포함 여부만 보는 약한 검사). 시나리오 48.
+
+## v0.4.0 — 메시지별 번역 버튼 + 수동 모드 기본화 (2026-09-02)
+
+제품 요구사항 원문: "메세지 옆에 번역버튼을 만들어서 필요한 메세지만 번역을 하는걸로 기본 설정을 바꾸자. 기존에 있던 번역 시작버튼을 전체번역 버튼으로 용도를 바꿔줘." 결정 사항은 오케스트레이터가 사전에 확정했고(구현 지시서 기반), 구현 워커는 그대로 실행했다.
+
+### `translateMode` 키와 마이그레이션
+기존 `autoTranslate: true`(`DEFAULTS`) 자리를 `translateMode: 'manual'`로 완전히 대체했다 — `autoTranslate`는 `DEFAULTS`/설정 패널/`decidePriority`/`_fillFromCfg`/저장 패치 전부에서 은퇴시켰고 재해석 코드도 넣지 않았다. 저장소에 남은 v0.3.x 설정에는 `translateMode` 키가 아예 없으므로 `Object.assign({}, DEFAULTS, stored)` 병합만으로 자동으로 `'manual'`이 된다 — **키 부재 = manual이 곧 마이그레이션**이다. 별도 마이그레이션 스크립트는 필요 없지만, 알 수 없는 값(`'zzz'` 등) 방어를 위해 순수 함수 `Store.migrate(stored)`를 신설해 `Store.load()`가 이를 통해서만 `cfg`를 만들도록 했다. 부작용이 없어 하네스가 저장소를 건드리지 않고도 마이그레이션 자체를 검증할 수 있다(시나리오 49-A).
+
+### 버튼을 별도 요소가 아니라 `div.dcxlt`의 `data-state="manual"`로 구현한 이유
+메시지당 이미 존재하는 번역 블록(`div.dcxlt[data-dcxlt-id]`)에 신규 상태 `'manual'`을 추가하고 그 안에 `<button class="dcxlt-mbtn">▶ 번역</button>`을 심어, 상태에 따라 `hidden`만 토글하는 방식을 택했다. 이유:
+- **멱등 주입** — `Render.upsert`가 `blockFor(msgId)`로 기존 블록을 찾아 재사용하므로 reconcile이 몇 번 돌아도 버튼이 중복 생기지 않는다.
+- **가상 리스트 재마운트 생존** — 언마운트 시 `Render.activeIds()` GC가 정리하고, 재마운트 시 다음 스윕이 done/loading 블록과 동일한 경로로 다시 그린다.
+- **해시 오염 회피** — 버튼을 콘텐츠 노드(`#message-content-*`) 안에 넣으면 `Extract.walkChildren`이 버튼 텍스트까지 원문에 섞어 해시가 흔들리고 캐시가 전부 무효화된다. `div.dcxlt`는 `Extract`가 절대 워킹하지 않는 형제 요소라 안전하다.
+- 죽어 있던 `state === 'skipped-manual'` 분기(호출처 0곳, 이번 기능의 초기 설계 잔재)를 `'manual'` 분기로 교체해 재사용했다.
+
+### reconcile fast-path에서 `manual` 상태만 자동 모드일 때 통과시키는 이유
+`reconcile`/`reconcileEmbeds`의 fast-path는 해시가 같은 기존 블록을 만나면 조기 return해 스윕 비용을 아낀다. 그런데 `manual` 블록은 무조건 조기 return시키면 **모드를 자동으로 바꿔도 이미 그려진 수동 버튼이 영원히 그대로 남는다**(다시는 큐잉되지 않음). 그래서 `existing.dataset.state === 'manual'`일 때만 별도 분기를 둬 `cfg.translateMode !== 'auto'`인 동안만 return하고, 자동으로 바뀐 뒤에는 아래로 흘려보내 정상 큐잉 경로를 타게 했다. 시나리오 54(D)가 정확히 이 회귀를 잡는다.
+
+### 모드 전환 시 `State.previousSeen`을 비워야 하는 이유
+수동 대기 블록도 매 스윕에서 `resolved`(→ 다음 스윕의 `previousSeen`)에 들어간다. 모드를 자동으로 바꾼 직후의 스윕이 `previousSeen`을 그대로 물려받으면, 화면의 메시지를 전부 "이미 마운트된 적 있음"으로 보고 `decidePriority`의 라이브 경로(`nearBottom && isNewlyMounted → priority 0`)를 건너뛰어 백필 대기로 강등시킨다 — 결과적으로 "모드를 전환해도 아무 일도 안 일어난 것처럼 보이는" 버그가 된다. 설정 패널 저장 핸들러(모드가 바뀐 경우)와 위젯의 모드 칩 클릭(`Widget.onModeToggle`) 양쪽에서 `State.previousSeen = new Set()`로 초기화한다.
+
+### 수동 모드에서 `glossaryRecheck`를 끄는 트레이드오프
+"수동 모드에서는 스크립트가 스스로 API를 부르지 않는다"는 불변식을 용어집 rev 조건부 재번역보다 우선시켰다. `glossaryRecheck`에 `if (cfg.translateMode !== 'auto') return;` 가드를 추가해, 수동 모드에서는 용어집이 갱신돼도 이미 번역된 메시지가 자동으로 재번역되지 않는다(README/HANDOFF에 알려진 한계로 문서화, 자동 모드는 기존 그대로 동작 — 시나리오 28).
+
+### 하네스 설계: 기존 48개 보존 + 제품 기본값은 별도 검증
+`BASE_SETTINGS`(하네스 전용 독립 리터럴)에 `translateMode: 'auto'` 한 줄만 추가해 기존 48개 시나리오를 예전과 동일한 자동 모드로 유지했다(46번의 위젯 라벨 어서션 2곳만 `⚡ 전체 번역`로 수정). 반면 "진짜 제품 기본값이 manual인가"는 하네스 기본값에 속지 않도록 시나리오 49가 `window.__DCXLT__.DEFAULTS`(신규 디버그 익스포트)와 `Store.migrate()`를 직접 호출해 검증한다.
+
+### 시나리오 49-54 요약
+- **49** — 제품 기본값이 `manual`임을 `DEFAULTS`/`Store.migrate`로 직접 검증 + 수동 모드에서는 마운트/뷰포트 백필 어느 경로로도 API가 0건임을 확인.
+- **50** — `[▶ 번역]` 버튼이 번역 대상에만 노출되고(skip 대상엔 없음), 재조정 반복에도 멱등하며, 가상 리스트 재마운트 후에도 다시 나타남을 확인.
+- **51** — 버튼 클릭이 정확히 그 메시지 1건만 큐잉함(요청 1건, 재클릭 멱등)을 확인. **추가 델타**: API 키가 사후에 지워진 상태에서 버튼을 누르면 `UI.promptForKey()`로만 이어지고 요청 0건, 블록은 `manual`로 남는 안전망 경로도 같은 시나리오에서 검증(시나리오 개수는 유지).
+- **52** — 수동 모드에서도 TCache/History 히트는 클릭 없이 즉시 렌더되고 `History.recordFromCache` 백필도 그대로 동작함(API 0건)을 확인.
+- **53** — 위젯 `⚡ 전체 번역`이 화면의 대상(임베드 포함)을 일괄 큐잉하는 1회성 동작이며, 클릭 이후 새로 도착한 메시지는 다시 수동 대기로 남음을 확인.
+- **54** — 설정 패널 저장으로 모드가 영속되고, 위젯 모드 칩으로 왕복 전환되며, 전환 시 대기 중이던 수동 블록이 즉시 번역되고(R1 회귀 방지), 패널 재오픈이 최신 모드를 반영함을 확인.
+
+하네스 55개(54 시나리오 + 네트워크 어서션 1) 전원 `PASS`, `DCXLT_SUMMARY pass=55 fail=0 skipped=0 xhr=0` 2회 연속.
 
 ## 진행 로그
 - 08-31 18:40 GitHub 공개 리포 생성·초기 스냅샷 푸시 (사용자 승인)
